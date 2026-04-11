@@ -1,0 +1,18 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs & data
+logs/
+data/
+*.log
+
+# Portfolio state (persoonlijk)
+portfolio.json
+backtest_result.json
