@@ -49,6 +49,7 @@ class AutoConfig:
     ladder_enabled:    bool  = True   # ladder trading: meerdere buckets per stad/datum
     tail_bets:         bool  = False  # Hans323-stijl tail bets (<5¢ buckets met model >8%) — uit: geeft onrealistisch hoge returns
     tail_bet_amount:   float = 3.0    # vaste inzet per tail bet ($)
+    max_per_date:      int   = int(os.getenv("AUTO_MAX_PER_DATE", "4"))  # max open posities per resolutiedatum
 
 
 # ── State (thread-safe) ───────────────────────────────────────────────────────
@@ -206,7 +207,7 @@ def execute_trade(opportunity, amount: float, dry_run: bool) -> tuple[bool, str]
         return False, "Geen conditionId beschikbaar"
 
     try:
-        from py_clob_client.clob_types import MarketOrderArgs
+        from py_clob_client.clob_types import OrderArgs
         client   = get_clob_client()
         market   = client.get_market(condition_id)
         tokens   = market.get("tokens", []) if isinstance(market, dict) else []
@@ -219,9 +220,32 @@ def execute_trade(opportunity, amount: float, dry_run: bool) -> tuple[bool, str]
         if not token_id:
             return False, f"Token niet gevonden voor {outcome}"
 
-        order = client.create_market_order(MarketOrderArgs(token_id=token_id, amount=amount))
-        resp  = client.post_order(order, orderType="FOK")
-        return True, f"Order OK: {resp}"
+        # Gebruik entry price als limit prijs (= huidige marktprijs van de kant die we kopen)
+        entry_price = opportunity.poly_price if "YES" in direction else (1 - opportunity.poly_price)
+        # Rond af op 2 decimalen (Polymarket tick size)
+        price = round(entry_price, 2)
+        if price <= 0 or price >= 1:
+            return False, f"Ongeldige prijs: {price}"
+
+        size = round(amount / price, 2)  # aantal shares
+
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side="BUY",
+        ))
+        resp = client.post_order(order, orderType="GTC")
+
+        # Haal order ID op uit response
+        order_id = ""
+        if isinstance(resp, dict):
+            order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id") or ""
+            err = resp.get("error", "")
+            if err:
+                return False, f"Order fout: {err}"
+
+        return True, f"GTC order geplaatst: {order_id or resp}"
 
     except Exception as e:
         return False, f"Order fout: {e}"
@@ -242,11 +266,21 @@ def calculate_trade_size(opportunity, config: AutoConfig) -> float:
     if budget_left <= 0:
         return 0
 
-    # Gebruik starting_balance als Kelly-bankroll referentie.
-    # Dit voorkomt dat een grote winst de volgende bet automatisch opblaast.
+    # Gebruik echte wallet equity als Kelly-bankroll (cash + open positie waarde).
+    # Haalt live waarde op van Polymarket API zodat het de werkelijke portefeuille weerspiegelt.
     try:
-        from portfolio import load_portfolio
-        _ref_bankroll = load_portfolio().starting_balance
+        import os, requests as _req
+        from eth_account import Account as _Acc
+        _addr = _Acc.from_key(os.getenv("PK", "")).address
+        _r = _req.get(f"https://data-api.polymarket.com/value?user={_addr}", timeout=6)
+        _cash = float(_r.json()[0]["value"]) if _r.status_code == 200 else 0
+        _r2 = _req.get(f"https://data-api.polymarket.com/positions?user={_addr}&sizeThreshold=0.1&limit=200", timeout=8)
+        _pos_val = sum(float(p.get("size", 0)) * float(p.get("curPrice", 0))
+                       for p in (_r2.json() if _r2.status_code == 200 else [])
+                       if float(p.get("curPrice", 0)) > 0.02)
+        _ref_bankroll = _cash + _pos_val
+        if _ref_bankroll < 10:
+            raise ValueError("bankroll te laag")
     except Exception:
         _ref_bankroll = config.daily_budget
 
@@ -263,8 +297,9 @@ def calculate_trade_size(opportunity, config: AutoConfig) -> float:
     )
 
     bet = result.get("bet", 0)
-    # Hard cap: nooit meer dan max_trade, ongeacht bankroll of winsten
-    return min(bet, config.max_trade, budget_left)
+    # Hard cap: nooit meer dan max_trade én nooit meer dan 5% van bankroll per trade
+    per_trade_cap = _ref_bankroll * 0.05
+    return min(bet, config.max_trade, per_trade_cap, budget_left)
 
 
 # ── Ladder trading ───────────────────────────────────────────────────────────
@@ -609,6 +644,23 @@ def run_scan_and_trade():
     cfg = state.config
     state.status = "scanning"
     state.add_log(f"Scan gestart (min_gap={cfg.min_gap*100:.0f}%, budget_over=${state.budget_left:.0f})")
+
+    # Stap 1: check of GTC orders gevuld zijn
+    try:
+        from resolve_trades import check_order_fills, resolve_open_trades
+        fills = check_order_fills(dry_run=False)
+        if fills["filled"] > 0:
+            state.add_log(f"Order fills: {fills['filled']} GTC orders gevuld")
+    except Exception as e:
+        state.add_log(f"Fill-check fout (niet kritiek): {e}")
+
+    # Stap 2: resolve open posities via Polymarket API
+    try:
+        result = resolve_open_trades(dry_run=False)
+        if result["resolved"] > 0:
+            state.add_log(f"Resolved: {result['resolved']} trades (via condition_id)")
+    except Exception as e:
+        state.add_log(f"Resolve fout (niet kritiek): {e}")
 
     # Scan weather markten
     try:

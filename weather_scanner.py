@@ -22,8 +22,12 @@ load_dotenv()
 GAMMA_API  = "https://gamma-api.polymarket.com/markets"
 OPENMETEO  = "https://api.open-meteo.com/v1/forecast"
 
-MIN_GAP    = 0.40   # minimaal 40%-punt verschil — backtest: < 40% geeft < 47% accuracy (verlies)
+MIN_GAP    = 0.35   # minimaal 35%-punt — HOOG confidence met lage spread heeft hogere trefzekerheid
 MIN_VOLUME = 50.0   # minimaal $50/dag volume — illiquide markten hebben slechte spreads
+
+# YES-bets op lage prijzen (<20%) zijn historisch verliesgevend: 0W/1L (-$20)
+# Daarom extra filter: alleen YES als poly_price >= 0.20
+MIN_YES_PRICE = 0.20
 
 # Steden → coördinaten
 CITIES = {
@@ -476,14 +480,32 @@ def scan() -> list[WeatherOpportunity]:
         else:  # between / exact
             threshold_dist = min(abs(forecast_c - low_c), abs(forecast_c - high_c))
 
-        # Verhoog effectieve gap-drempel als forecast dicht bij de grens zit
-        # (< 1°C afstand = heel onzeker, < 2°C = matig)
-        if threshold_dist < 1.0:
-            effective_min_gap = MIN_GAP * 2.0   # dubbele drempel bij grensgeval
-        elif threshold_dist < 2.0:
-            effective_min_gap = MIN_GAP * 1.5
+        # ── Dynamische gap-drempel op basis van modelconsensus ──────────────
+        # Hoge consensus (veel modellen eens, lage spread) → lagere drempel
+        # Lage consensus (modellen verdeeld, hoge spread) → hogere drempel
+        confidence = fc.get("confidence", "MATIG")
+        if confidence == "HOOG" and n_sources >= 5:
+            consensus_factor = 0.80   # 80% van base → 32% bij MIN_GAP=0.40
+        elif confidence == "MATIG" or n_sources < 4:
+            consensus_factor = 1.20   # 120% van base → 48%
+        elif confidence == "LAAG":
+            consensus_factor = 1.50   # wordt al gefilterd boven, maar als fallback
         else:
-            effective_min_gap = MIN_GAP
+            consensus_factor = 1.00
+
+        # ── Grensafstand correctie (op consensus_factor) ─────────────────────
+        # (< 1°C afstand = heel onzeker, < 2°C = matig)
+        # Bij HOOG confidence + 5 modellen is de grensafstand minder kritiek:
+        # de modellen zijn het eens, dus de onzekerheid is al verwerkt in de spread
+        high_conf = (confidence == "HOOG" and n_sources >= 5)
+        if threshold_dist < 1.0:
+            boundary_factor = 1.4 if high_conf else 2.0
+        elif threshold_dist < 2.0:
+            boundary_factor = 1.1 if high_conf else 1.5
+        else:
+            boundary_factor = 1.0
+
+        effective_min_gap = MIN_GAP * consensus_factor * boundary_factor
 
         # ── Model shift detectie ─────────────────────────────────────────────
         model_shift_val = 0.0
@@ -496,6 +518,11 @@ def scan() -> list[WeatherOpportunity]:
             pass
 
         volume = float(market.get("volume24hr") or 0)
+
+        # Filter: YES-bets op te lage prijzen zijn historisch verliesgevend
+        if gap > 0 and poly_price < MIN_YES_PRICE:
+            continue
+
         if abs(gap) >= effective_min_gap and volume >= MIN_VOLUME:
             display_temp = forecast_c if parsed["unit"] == "C" else forecast_c * 9/5 + 32
             q = market.get("question", "")
@@ -544,8 +571,6 @@ def scan() -> list[WeatherOpportunity]:
                     # Inversie: lo is goedkoper dan hi terwijl drempel lager is
                     lo.consistency_bonus = 0.05
 
-    opportunities = sorted(opportunities, key=lambda o: abs(o.gap) + o.consistency_bonus, reverse=True)
-
     # Sla scan resultaten op naar data/scan_log.jsonl
     import json as _json
     import pathlib as _pathlib
@@ -572,6 +597,85 @@ def scan() -> list[WeatherOpportunity]:
             _f.write(_json.dumps(_record) + "\n")
     except Exception:
         pass
+
+    # ── ColdMath-stijl scan: near-impossible YES prijzen ─────────────────────
+    # Zoek markten waar YES nog 5-22% staat maar model <8% berekent
+    # Dit zijn structurele mispricingen — liquidity providers hebben prijs niet bijgewerkt
+    from datetime import timedelta as _td
+    coldmath_min_date = (datetime.now(timezone.utc) + _td(days=1)).strftime("%Y-%m-%d")
+    for market in markets:
+        q      = market.get("question", "")
+        parsed = parse_temperature_question(q)
+        if not parsed:
+            continue
+        if parsed["date"] < coldmath_min_date:
+            continue
+        prices = market.get("outcomePrices", "[]")
+        if isinstance(prices, str):
+            try: prices = json.loads(prices)
+            except: continue
+        poly_price = float(prices[0]) if prices else 0
+        if not (0.05 < poly_price < 0.22):
+            continue
+        liq = float(market.get("liquidity") or 0)
+        if liq < 300:
+            continue
+
+        key = (parsed["city"], parsed["date"])
+        fc  = forecasts.get(key)
+        if not fc or "error" in fc:
+            continue
+        if fc.get("n_sources", 0) < 4:
+            continue
+        if fc.get("confidence") != "HOOG":
+            continue
+
+        forecast_c = fc["consensus"]
+        spread = fc.get("spread", 2.0)
+        if fc.get("spread_source") == "ensemble":
+            spread = spread / 2.56
+        try:
+            from datetime import date as _date2
+            _days = (_date2.fromisoformat(parsed["date"]) - _date2.today()).days
+        except Exception:
+            _days = 2
+        model_prob_yes = model_probability(forecast_c, parsed, spread=spread, days_ahead=_days)
+
+        # Alleen als model zegt <8% en prijs is >5%: structurele mispricing
+        no_gap = poly_price - model_prob_yes
+        if model_prob_yes >= 0.08 or no_gap < 0.08:
+            continue
+
+        # Check al in opportunities (voorkom duplicaat)
+        cid = market.get("conditionId", "")
+        if any(o.condition_id == cid for o in opportunities):
+            continue
+
+        volume = float(market.get("volume24hr") or 0)
+        if volume < MIN_VOLUME:
+            continue
+
+        display_temp = forecast_c if parsed["unit"] == "C" else forecast_c * 9/5 + 32
+        opportunities.append(WeatherOpportunity(
+            question=q,
+            city=parsed["city"].title(),
+            date=parsed["date"],
+            condition=parsed["condition"],
+            temp_low=parsed["temp_low"],
+            temp_high=parsed["temp_high"],
+            unit=parsed["unit"],
+            poly_price=poly_price,
+            forecast_temp=round(display_temp, 1),
+            model_prob=round(model_prob_yes, 3),
+            gap=round(-no_gap, 3),   # negatief = BUY NO
+            direction="BUY NO",
+            volume=volume,
+            condition_id=cid,
+            slug=market.get("slug", ""),
+            market_id=str(market.get("id", "")),
+        ))
+
+    opportunities = sorted(opportunities, key=lambda o: abs(o.gap) + o.consistency_bonus, reverse=True)
 
     return opportunities
 
@@ -603,7 +707,103 @@ def display(opportunities: list[WeatherOpportunity]):
         print()
 
 
+import threading
+import logging
+import time
+
+log = logging.getLogger("weather_scanner")
+
+ALERT_MIN_GAP   = 0.25   # lager dan trade-drempel — vroeg signaal sturen
+POLL_INTERVAL_S = 1800   # elke 30 minuten scannen
+
+
+class WeatherScanner:
+    """Achtergrond-scanner die continu op kansen scant en Telegram alerts stuurt."""
+
+    def __init__(self):
+        self._stop   = threading.Event()
+        self._seen   = set()          # al gemelde kansen (reset elke dag)
+        self._date   = None
+        self._thread = None
+        self.latest: list = []        # voor dashboard gebruik
+
+    def _reset_daily(self):
+        today = datetime.now(timezone.utc).date()
+        if today != self._date:
+            self._seen.clear()
+            self._date = today
+            log.info("Weather scanner: dagelijkse reset")
+
+    def _run(self):
+        log.info("Weather scanner achtergrond-loop gestart")
+        while not self._stop.is_set():
+            try:
+                self._reset_daily()
+                opps = scan()
+                self.latest = opps
+
+                for o in opps:
+                    if abs(o.gap) < ALERT_MIN_GAP:
+                        continue
+                    key = f"{o.question}:{round(o.gap, 2)}"
+                    if key in self._seen:
+                        continue
+                    self._seen.add(key)
+
+                    sign = "+" if o.gap > 0 else ""
+                    msg = (
+                        f"🌡 <b>WEATHER KANS</b>\n\n"
+                        f"📋 {o.question}\n"
+                        f"• Richting:    <b>{o.direction}</b>\n"
+                        f"• Polymarket:  {o.poly_price*100:.0f}%\n"
+                        f"• Model:       {o.model_prob*100:.0f}%\n"
+                        f"• GAP:         <b>{sign}{o.gap*100:.1f}%</b>\n"
+                        f"• Forecast:    {o.forecast_temp}°{o.unit}\n"
+                        f"• Vol/dag:     ${o.volume:,.0f}\n"
+                        + (f"• <a href=\"https://polymarket.com/event/{o.slug}\">Bekijk op Polymarket</a>\n" if o.slug else "")
+                    )
+                    try:
+                        from alerts import send_telegram
+                        send_telegram(msg)
+                        log.info(f"WEATHER ALERT: {o.city} {o.date} | {o.direction} | gap={sign}{o.gap*100:.1f}%")
+                    except Exception as e:
+                        log.warning(f"Telegram alert mislukt: {e}")
+
+            except Exception as e:
+                log.warning(f"Weather scanner fout: {e}")
+
+            self._stop.wait(POLL_INTERVAL_S)
+
+        log.info("Weather scanner gestopt")
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="weather-scanner")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+
 if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+
+    parser = argparse.ArgumentParser(description="Polymarket Weather Scanner")
+    parser.add_argument("--once",   action="store_true", help="Eenmalige scan")
+    parser.add_argument("--daemon", action="store_true", help="Blijf draaien (poll elke 30 min)")
+    args = parser.parse_args()
+
     print("── Polymarket Weather Temperature Scanner ───────────────")
     opps = scan()
     display(opps)
+
+    if args.daemon and not args.once:
+        print(f"\nContinue polling elke {POLL_INTERVAL_S // 60} minuten...")
+        ws = WeatherScanner()
+        ws.start()
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            ws.stop()
+            print("\nGestopt.")

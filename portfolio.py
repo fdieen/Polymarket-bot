@@ -34,8 +34,10 @@ class Position:
     timestamp:    str
     condition_id: str = ""
     market_id:    str = ""        # numeriek Gamma API id voor prijsupdates
+    order_id:     str = ""        # Polymarket CLOB order ID (GTC limit order)
+    order_filled: bool = False    # True zodra het limit order gevuld is
     note:         str = ""        # extra label, bijv. "[WHALE:ColdMath]" of "[MODEL]"
-    status:       str = "open"    # open / won / lost / cancelled
+    status:       str = "open"    # open / won / lost / cancelled / pending_fill
     exit_price:   float = 0.0
     pnl:          float = 0.0     # gerealiseerde P&L
     resolved_at:  str = ""
@@ -151,6 +153,7 @@ def record_trade(
     gap:            float,
     condition_id:   str = "",
     market_id:      str = "",
+    order_id:       str = "",
     note:           str = "",
     portfolio_file: str = None,
 ) -> dict:
@@ -179,6 +182,8 @@ def record_trade(
             timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             condition_id=condition_id,
             market_id=market_id,
+            order_id=order_id,
+            order_filled=order_id == "",  # direct filled als geen order_id (bijv. dry run)
             note=note,
             current_price=entry_price,
         )

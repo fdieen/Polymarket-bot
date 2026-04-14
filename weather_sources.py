@@ -15,9 +15,11 @@ Bronnen per prioriteit:
  11. BOM  via Open-Meteo        — Australisch model (Oceanië)
  12. CMA  via Open-Meteo        — Chinees model (Oost-Azië)
  13. Tomorrow.io               — ML-model (nauwkeurigst, gratis tier 500/dag)
+ 14. Synoptic Data             — 100.000+ actuele weerstations wereldwijd
 
 Gratis bronnen: 1-12 vereisen geen API key.
 Tomorrow.io: TOMORROW_API_KEY in .env (gratis via tomorrow.io/signup)
+Synoptic Data: SYNOPTIC_TOKEN in .env (gratis via synopticdata.com)
 """
 import os
 import json as _json
@@ -258,6 +260,53 @@ def get_nws_forecast(city: str, date: str) -> dict | None:
                     "icon":         p.get("icon", ""),
                 }
         return None
+    except Exception:
+        return None
+
+
+def get_synoptic(city: str) -> dict | None:
+    """
+    Synoptic Data — actuele meting van dichtstbijzijnde weerstation (100k+ stations).
+    Geeft de meest recente gemeten temperatuur, niet een modelvoorspelling.
+    Vereist SYNOPTIC_TOKEN in .env.
+    """
+    token = os.getenv("SYNOPTIC_TOKEN", "")
+    if not token:
+        return None
+    meta = CITY_META.get(city)
+    if not meta:
+        return None
+    icao, lat, lon = meta
+    try:
+        r = requests.get(
+            "https://api.synopticdata.com/v2/stations/latest",
+            params={
+                "token":   token,
+                "radius":  f"{lat},{lon},50",  # 50km straal
+                "vars":    "air_temp,wind_speed",
+                "limit":   1,
+                "units":   "metric",
+                "output":  "json",
+            },
+            timeout=8,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        stations = data.get("STATION", [])
+        if not stations:
+            return None
+        obs = stations[0].get("OBSERVATIONS", {})
+        temp = obs.get("air_temp_value_1", {})
+        temp_c = temp.get("value") if isinstance(temp, dict) else None
+        if temp_c is None:
+            return None
+        return {
+            "source":  "Synoptic",
+            "temp_c":  round(float(temp_c), 1),
+            "station": stations[0].get("NAME", ""),
+            "obs_time": obs.get("air_temp_value_1", {}).get("date_time", "") if isinstance(temp, dict) else "",
+        }
     except Exception:
         return None
 
@@ -613,6 +662,12 @@ def multi_source_forecast(city: str, date: str) -> dict:
     tmrw = get_tomorrow_io(city, date)
     if tmrw and tmrw["temp_max"] is not None:
         results["Tomorrow.io"] = tmrw; temps.append(tmrw["temp_max"]); weights.append(5)
+
+    # ── Synoptic Data (actuele meting — alleen VS stations) ───────────────────
+    if -130 < lon < -60 and 15 < lat < 72:
+        synoptic = get_synoptic(city)
+        if synoptic and synoptic.get("temp_c") is not None:
+            results["Synoptic"] = synoptic; temps.append(synoptic["temp_c"]); weights.append(4)
 
     if not temps:
         return {"error": "Geen weerdata beschikbaar"}
