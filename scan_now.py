@@ -8,6 +8,9 @@ from auto_trader import calculate_trade_size, execute_trade, state
 from portfolio import record_trade
 from datetime import datetime, timezone, timedelta, date as _date
 
+# Polymarket fee (~2%) verrekend in effectieve gap-drempel
+FEE_CORRECTION = 0.02
+
 markets = fetch_temperature_markets()
 now = datetime.now(timezone.utc)
 min_date = (now + timedelta(days=1)).strftime('%Y-%m-%d')
@@ -33,8 +36,8 @@ forecasts = {}
 for city, date in city_date_pairs:
     forecasts[(city, date)] = multi_source_forecast(city, date)
 
-print(f"{'Gap':>6} | {'Dir':<8} | {'Poly':>5} | {'Model':>6} | n | Markt")
-print("-"*95)
+print(f"{'Gap':>6} | {'Dir':<8} | {'Poly':>5} | {'Model':>6} | {'Cond':<7} | n | d | Markt")
+print("-"*105)
 results = []
 for market, parsed, poly_price in candidates:
     key = (parsed['city'], parsed['date'])
@@ -49,37 +52,53 @@ for market, parsed, poly_price in candidates:
     gap = model_p - poly_price
     vol24 = float(market.get('volume24hr') or 0)
     if vol24 < 50: continue
-    # YES-bets op lage prijzen historisch verliesgevend (0W/1L, -$20)
+
+    # 1. YES-bets op lage prijzen historisch verliesgevend
     if gap > 0 and poly_price < 0.20:
         continue
-    # Exact-match markten zijn hoge-variantie: vereist grotere gap (25%)
+
+    # 2. Exact-match: hoge-variantie, vereist grotere gap (25%) en alleen NO-richting
     if parsed['condition'] == 'exact' and abs(gap) < 0.25:
         continue
-    # YES-bets op exact-match overgeslagen — model kan exacte waarde niet betrouwbaar voorspellen
     if parsed['condition'] == 'exact' and gap > 0:
         continue
-    results.append((abs(gap), gap, market, parsed, poly_price, model_p, fc, days))
+
+    # 3. Sweet spot: 2-4 dagen vooruit krijgt bonuspunten in ranking
+    #    1 dag = te weinig tijd, 5+ dagen = onzekerder forecast
+    if days < 1:
+        continue
+    day_bonus = 0.05 if 2 <= days <= 4 else 0.0
+
+    # 4. Above/below markten krijgen bonuspunten boven exact-match
+    cond_bonus = 0.03 if parsed['condition'] in ('above', 'below') else 0.0
+
+    # Effectieve gap na fees en bonussen voor sortering
+    sort_key = abs(gap) - FEE_CORRECTION + day_bonus + cond_bonus
+
+    results.append((sort_key, abs(gap), gap, market, parsed, poly_price, model_p, fc, days))
 
 results.sort(reverse=True)
 cfg = state.config
-print(f"Config: max=${cfg.max_trade} dry={cfg.dry_run} min_gap={cfg.min_gap*100:.0f}%\n")
-for rank, (_, gap, market, parsed, poly_price, model_p, fc, days) in enumerate(results[:15], 1):
+# 5. Effectieve min_gap na fees: verhoog drempel met 2%
+effective_min_gap = cfg.min_gap + FEE_CORRECTION
+print(f"Config: max=${cfg.max_trade} dry={cfg.dry_run} min_gap={cfg.min_gap*100:.0f}% (+{FEE_CORRECTION*100:.0f}% fees={effective_min_gap*100:.0f}% effectief)\n")
+for rank, (_, abs_gap, gap, market, parsed, poly_price, model_p, fc, days) in enumerate(results[:15], 1):
     direction = "BUY YES" if gap > 0 else "BUY NO"
-    flag = " ← TRADE" if abs(gap) >= cfg.min_gap else ""
-    print(f"#{rank} {gap*100:+5.1f}% {direction:<8} poly={poly_price*100:.0f}% model={model_p*100:.0f}% n={fc['n_sources']} d={days} | {market.get('question','')[:55]}{flag}")
+    flag = " ← TRADE" if abs_gap >= effective_min_gap else ""
+    cond = parsed['condition'][:5]
+    print(f"#{rank} {gap*100:+5.1f}% {direction:<8} poly={poly_price*100:.0f}% model={model_p*100:.0f}% {cond:<7} n={fc['n_sources']} d={days} | {market.get('question','')[:45]}{flag}")
 
-# Alle kansen boven drempel plaatsen
+# Alle kansen boven effectieve drempel plaatsen
 from weather_scanner import WeatherOpportunity
 from portfolio import load_portfolio
 
 tradeable = [(gap, market, parsed, poly_price, model_p, fc)
-             for _, gap, market, parsed, poly_price, model_p, fc, _ in results
-             if abs(gap) >= cfg.min_gap]
+             for _, abs_gap, gap, market, parsed, poly_price, model_p, fc, _ in results
+             if abs_gap >= effective_min_gap]
 
 if not tradeable:
     print("\nGeen kansen boven drempel op dit moment.")
 else:
-    # Filter al open posities — herlaad portfolio ná elke trade zodat duplicates worden geblokkeerd
     import re as _re
 
     def get_open_questions():
@@ -91,7 +110,7 @@ else:
                 if p.get('status') == 'open' and p.get('condition_id', '')}
 
     def count_open_per_date():
-        """Tel open posities per resolutiedatum (gebaseerd op 'April DD' in question)."""
+        """Tel open posities per resolutiedatum."""
         counts = {}
         for p in load_portfolio().positions:
             if p.get('status') != 'open': continue
@@ -104,30 +123,50 @@ else:
             counts[key] = counts.get(key, 0) + 1
         return counts
 
+    def count_open_per_city():
+        """Tel open posities per stad — max 2 per stad om concentratie te voorkomen."""
+        counts = {}
+        for p in load_portfolio().positions:
+            if p.get('status') != 'open': continue
+            city = p.get('question', '').lower()
+            # Extraheer stad uit vraag (eerste stad-token na "in ")
+            m = _re.search(r'temperature in ([a-z ]+?) be', city)
+            key = m.group(1).strip() if m else 'unknown'
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    MAX_PER_CITY = 2  # max posities per stad tegelijk
+
     open_questions = get_open_questions()
     print(f"\n{len(tradeable)} kansen boven drempel, al open: {len(open_questions & {m.get('question','') for _,m,*_ in tradeable})}")
 
     for gap, market, parsed, poly_price, model_p, fc in tradeable:
         q = market.get('question', '')
-        # Herlaad elke iteratie zodat net geplaatste trades direct worden geblokkeerd
+        # Herlaad elke iteratie
         open_questions = get_open_questions()
         if q in open_questions:
             print(f"  Skip (al open): {q[:60]}")
             continue
 
-        # Blokkeer tegengestelde positie op hetzelfde market (voorkomt Warsaw-scenario)
+        # Blokkeer tegengestelde positie op zelfde markt
         cid = market.get('conditionId', '')
         open_cids = get_open_condition_ids()
         if cid and cid in open_cids:
-            print(f"  Skip (al positie op markt, tegengesteld geblokkeerd): {q[:55]}")
+            print(f"  Skip (al positie op markt): {q[:55]}")
             continue
 
-        # Spreiding over datums — max AUTO_MAX_PER_DATE posities per resolutiedatum
+        # Spreiding over datums
         date_counts = count_open_per_date()
         res_date = parsed['date']
-        current_on_date = date_counts.get(res_date, 0)
-        if current_on_date >= cfg.max_per_date:
-            print(f"  Skip (max {cfg.max_per_date}/datum bereikt voor {res_date}): {q[:50]}")
+        if date_counts.get(res_date, 0) >= cfg.max_per_date:
+            print(f"  Skip (max {cfg.max_per_date}/datum voor {res_date}): {q[:50]}")
+            continue
+
+        # Spreiding over steden — max MAX_PER_CITY posities per stad
+        city_counts = count_open_per_city()
+        city_key = parsed['city'].lower()
+        if city_counts.get(city_key, 0) >= MAX_PER_CITY:
+            print(f"  Skip (max {MAX_PER_CITY}/stad voor {city_key}): {q[:50]}")
             continue
 
         opp = WeatherOpportunity(
@@ -153,7 +192,6 @@ else:
         if success:
             outcome = "YES" if "YES" in opp.direction else "NO"
             price = opp.poly_price if outcome == "YES" else (1 - opp.poly_price)
-            # Haal order_id uit de note (GTC order ID)
             import re as _re2
             oid_match = _re2.search(r'GTC order geplaatst: (\S+)', note)
             order_id = oid_match.group(1) if oid_match else ""
