@@ -4538,9 +4538,82 @@ def _run_whale_follow():
             else:
                 _portfolio_type = "crypto"
 
-        # Sla weather-whales over in de crypto auto-follow
+        # Weather whales: aparte copy-logica met strengere filters
         if _portfolio_type == "weather":
-            state[addr] = new_max_ts  # watermark bijwerken maar niet kopiëren
+            _weather_kw = {"temperature", "celsius", "fahrenheit", "temp"}
+            _weather_filter = lambda title: any(k in title.lower() for k in _weather_kw)
+            _copied_cids_w = set(state.get(f"{addr}_cids", []))
+
+            new_weather_trades = sorted([
+                t for t in trades
+                if int(t.get("timestamp", 0)) > last_ts
+                and t.get("side", "").upper() == "BUY"
+                and float(t.get("usdcSize") or 0) >= 50.0          # geen test-orders
+                and float(t.get("price") or 1.0) < 0.80            # niet al zeker ingeprijsd
+                and _weather_filter(t.get("title", ""))
+                and t.get("conditionId", "") not in _copied_cids_w
+            ], key=lambda t: int(t.get("timestamp", 0)))
+
+            if trades:
+                new_max_ts = max(int(t.get("timestamp", 0)) for t in trades)
+
+            from portfolio import load_portfolio as _lp_main, record_trade as _rt_main
+            for t in new_weather_trades:
+                p      = _lp_main()
+                amount = round(p.cash * _WHALE_COPY_PCT, 2)
+                if amount < 1.0:
+                    break
+
+                outcome = "YES" if t.get("outcomeIndex", 0) == 0 else "NO"
+                price   = float(t.get("price") or 0.5)
+                title   = t.get("title", "?")
+                cid     = t.get("conditionId", "")
+
+                market_id = ""
+                if cid:
+                    try:
+                        gm = requests.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"conditionIds": cid}, timeout=6,
+                        )
+                        if gm.status_code == 200:
+                            gdata = gm.json()
+                            if gdata:
+                                market_id = str(gdata[0].get("id", ""))
+                    except Exception:
+                        pass
+
+                result = _rt_main(
+                    question=title,
+                    direction=outcome,
+                    amount=amount,
+                    entry_price=price,
+                    model_prob=price,
+                    gap=0.0,
+                    condition_id=cid,
+                    market_id=market_id,
+                    note=f"[WHALE:{name}:HOOG]",
+                )
+
+                if "error" not in result:
+                    ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    log_entry = {
+                        "ts":      ts_str,
+                        "whale":   name,
+                        "outcome": outcome,
+                        "amount":  amount,
+                        "price":   round(price, 4),
+                        "title":   title,
+                    }
+                    _whale_copy_log.insert(0, log_entry)
+                    if len(_whale_copy_log) > 50:
+                        _whale_copy_log.pop()
+                    print(f"[WHALE-WEATHER] {name}: {outcome} ${amount:.0f} @ {price*100:.0f}% | {title[:55]}")
+                    if cid:
+                        _copied_cids_w.add(cid)
+                        state[f"{addr}_cids"] = list(_copied_cids_w)
+
+            state[addr] = new_max_ts
             continue
 
         # Alleen BTC/crypto markten kopiëren
