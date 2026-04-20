@@ -11,9 +11,9 @@ import json
 import requests
 import os
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, ApiCreds
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import MarketOrderArgs, ApiCreds
+from py_clob_client_v2.constants import POLYGON
 
 load_dotenv()
 
@@ -71,7 +71,7 @@ def place_market_order(client: ClobClient, token_id: str, side: str, amount: flo
             token_id=token_id,
             amount=amount,
         ))
-        resp = client.post_order(order, orderType="FOK")
+        resp = client.post_order(order, order_type="FOK")
         print(f"\n✓ Order uitgevoerd: {side} ${amount} USDC")
         print(f"  Response: {resp}")
         return True

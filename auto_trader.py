@@ -19,6 +19,7 @@ import threading
 import logging
 from datetime import datetime, timezone, date
 from dataclasses import dataclass, field
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -36,8 +37,8 @@ logging.basicConfig(
 class AutoConfig:
     enabled:       bool  = os.getenv("AUTO_TRADE", "true").lower() != "false"
     min_gap:       float = float(os.getenv("AUTO_MIN_GAP",  "0.70"))
-    max_trade:     float = float(os.getenv("AUTO_MAX_TRADE", "25"))
-    daily_budget:  float = float(os.getenv("AUTO_DAILY_BUDGET", "200"))
+    max_trade:     float = float(os.getenv("AUTO_MAX_TRADE", "50"))
+    daily_budget:  float = float(os.getenv("AUTO_DAILY_BUDGET", "300"))
     scan_interval: int   = int(os.getenv("AUTO_SCAN_INTERVAL", "600"))
     dry_run:       bool  = os.getenv("AUTO_DRY_RUN", "true").lower() != "false"
     kelly_fraction:    float = 0.25  # Quarter Kelly
@@ -169,9 +170,9 @@ state = AutoTraderState()
 
 def get_clob_client():
     """Maakt CLOB client aan vanuit .env credentials."""
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
-    from py_clob_client.constants import POLYGON
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import ApiCreds
+    from py_clob_client_v2.constants import POLYGON
 
     pk         = os.getenv("PK")
     api_key    = os.getenv("CLOB_API_KEY")
@@ -207,7 +208,7 @@ def execute_trade(opportunity, amount: float, dry_run: bool) -> tuple[bool, str]
         return False, "Geen conditionId beschikbaar"
 
     try:
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client_v2.clob_types import OrderArgs
         client   = get_clob_client()
         market   = client.get_market(condition_id)
         tokens   = market.get("tokens", []) if isinstance(market, dict) else []
@@ -235,7 +236,7 @@ def execute_trade(opportunity, amount: float, dry_run: bool) -> tuple[bool, str]
             size=size,
             side="BUY",
         ))
-        resp = client.post_order(order, orderType="GTC")
+        resp = client.post_order(order, order_type="GTC")
 
         # Haal order ID op uit response
         order_id = ""
@@ -245,7 +246,10 @@ def execute_trade(opportunity, amount: float, dry_run: bool) -> tuple[bool, str]
             if err:
                 return False, f"Order fout: {err}"
 
-        return True, f"GTC order geplaatst: {order_id or resp}"
+        if not order_id:
+            return False, f"Geen order_id ontvangen — order mogelijk niet geplaatst: {resp}"
+
+        return True, f"GTC order geplaatst: {order_id}"
 
     except Exception as e:
         return False, f"Order fout: {e}"
@@ -297,9 +301,31 @@ def calculate_trade_size(opportunity, config: AutoConfig) -> float:
     )
 
     bet = result.get("bet", 0)
-    # Hard cap: nooit meer dan max_trade én nooit meer dan 5% van bankroll per trade
+
+    # Hard cap schaalt mee met gap-grootte — hogere confidence = groter bedrag toegestaan
+    gap = abs(getattr(opportunity, "gap", 0))
+    if gap >= 0.45:
+        trade_cap = config.max_trade        # volledig max bij gap >= 45%
+    elif gap >= 0.35:
+        trade_cap = config.max_trade * 0.75  # 75% bij gap >= 35%
+    else:
+        trade_cap = config.max_trade * 0.50  # 50% bij lagere gaps (between markten)
+
+    # Source agreement multiplier: alle bronnen eens → tot 40% groter positie
+    # Eén bron of bronnen verdeeld → positie verkleinen
+    agreement = getattr(opportunity, "source_agreement", 0.5)
+    if agreement >= 0.80:
+        agree_mult = 1.40   # sterke overeenstemming: +40%
+    elif agreement >= 0.60:
+        agree_mult = 1.20   # goede overeenstemming: +20%
+    elif agreement >= 0.40:
+        agree_mult = 1.00   # gemiddeld: geen aanpassing
+    else:
+        agree_mult = 0.60   # bronnen verdeeld: -40% (voorzichtig)
+    trade_cap = trade_cap * agree_mult
+
     per_trade_cap = _ref_bankroll * 0.05
-    return min(bet, config.max_trade, per_trade_cap, budget_left)
+    return min(bet, trade_cap, per_trade_cap, budget_left)
 
 
 # ── Ladder trading ───────────────────────────────────────────────────────────
@@ -539,27 +565,47 @@ def run_whale_copy():
             if "temperature" not in t.title.lower():
                 continue
 
-            # Niet twee keer dezelfde markt
+            # Niet twee keer dezelfde markt — check zowel in-memory set als open portfolio
             market_key = f"whale:{t.condition_id}"
             if market_key in state.traded_markets:
                 continue
+            try:
+                from portfolio import load_portfolio as _lp_dedup
+                _pf_dedup = _lp_dedup()
+                if any(
+                    p.get("condition_id") == t.condition_id and p.get("status") == "open"
+                    for p in _pf_dedup.positions
+                ):
+                    state.traded_markets.add(market_key)  # ook in set zodat volgende scan snel is
+                    continue
+            except Exception:
+                pass
 
             # Trade sizing: schaalt mee met whale convictie
             # Hoe groter de whale trade, hoe hoger ons percentage én plafond
             if t.usdc_size >= 300:
-                pct, cap_mult, conviction = 0.20, 3.0, "HOOG"
+                pct, cap_mult, conviction = 0.10, 1.0, "HOOG"
             elif t.usdc_size >= 150:
-                pct, cap_mult, conviction = 0.17, 2.5, "HOOG"
+                pct, cap_mult, conviction = 0.08, 1.0, "HOOG"
             elif t.usdc_size >= 75:
-                pct, cap_mult, conviction = 0.14, 2.0, "MATIG"
+                pct, cap_mult, conviction = 0.07, 1.0, "MATIG"
             elif t.usdc_size >= 35:
-                pct, cap_mult, conviction = 0.12, 1.5, "MATIG"
+                pct, cap_mult, conviction = 0.06, 1.0, "MATIG"
             else:
-                pct, cap_mult, conviction = 0.10, 1.0, "LAAG"
+                pct, cap_mult, conviction = 0.05, 1.0, "LAAG"
 
             max_for_trade = cfg.max_trade * cap_mult
-            amount = min(t.usdc_size * pct, max_for_trade, state.budget_left)
-            amount = round(amount, 2)
+            whale_amount = min(t.usdc_size * pct, max_for_trade, state.budget_left)
+
+            # Kelly cap: whale trades ook begrenzen op basis van portfolio grootte
+            # Voorkomt dat grote whale trades onevenredig groot worden t.o.v. portefeuille
+            try:
+                from portfolio import load_portfolio as _lp
+                _pf = _lp()
+                kelly_cap = (_pf.cash + _pf.open_value) * 0.05  # max 5% van portfolio per whale trade
+            except Exception:
+                kelly_cap = cfg.max_trade
+            amount = round(min(whale_amount, kelly_cap), 2)
             if amount < 1:
                 continue
 
@@ -567,9 +613,74 @@ def run_whale_copy():
             direction = "YES" if t.outcome == "Yes" else "NO"
             entry_price = t.price if direction == "YES" else (1 - t.price)
 
-            # Tail bets altijd overslaan — entry <10¢ geeft onrealistisch hoge multipliers
+            # Tail bets overslaan — entry <10¢ geeft onrealistisch hoge multipliers
             if entry_price < 0.10:
                 state.add_log(f"SKIP tail bet {whale_name}: entry {entry_price*100:.1f}¢ < 10¢")
+                continue
+
+            # Near-certain bets overslaan — boven 90¢ is er nauwelijks winst mogelijk
+            if entry_price > 0.90:
+                state.add_log(f"SKIP whale {whale_name}: near-certain entry {entry_price*100:.1f}¢ > 90¢ (nauwelijks winst)")
+                continue
+
+            # Edge-check: haal huidige marktprijs op en kijk hoeveel edge nog over is
+            # Whale kocht op prijs X, als de markt sindsdien al ver bewogen is kopiëren we te laat
+            current_entry = None  # None = API niet bereikbaar
+            try:
+                from resolve_trades import fetch_market_status
+                mkt = fetch_market_status(t.condition_id, "")
+                if mkt:
+                    current_entry = mkt["yes_price"] if direction == "YES" else mkt["no_price"]
+            except Exception:
+                pass
+
+            # Als API niet bereikbaar is: skip trade — te riskant om blind te handelen
+            if current_entry is None:
+                state.add_log(f"SKIP whale {whale_name}: marktprijs niet op te halen, trade overgeslagen")
+                continue
+
+            whale_edge   = 1.0 - entry_price        # potentiële winst op moment whale kocht
+            current_edge = 1.0 - current_entry      # potentiële winst nu voor ons
+            edge_pct_remaining = current_edge / whale_edge if whale_edge > 0 else 0
+
+            MIN_EDGE_REMAINING = 0.50  # minimaal 50% van de originele whale-edge moet nog over zijn
+
+            if edge_pct_remaining < MIN_EDGE_REMAINING:
+                state.add_log(
+                    f"SKIP whale {whale_name}: edge al {(1-edge_pct_remaining)*100:.0f}% weg "
+                    f"(whale={entry_price*100:.0f}¢ → nu={current_entry*100:.0f}¢)"
+                )
+                continue
+
+            # Model-confidence check: eigen weermodel moet whale steunen
+            # Voorkomt dat we blindelings kopiëren als ons model het oneens is
+            MIN_MODEL_AGREEMENT = 0.55  # model moet minimaal 55% kans geven in richting van whale
+            try:
+                from weather_scanner import scan as _scan_weather
+                _opps = _scan_weather()
+                _match = next((o for o in _opps if o.condition_id == t.condition_id), None)
+                if _match:
+                    model_p = _match.model_prob if direction == "YES" else (1 - _match.model_prob)
+                    if model_p < MIN_MODEL_AGREEMENT:
+                        state.add_log(
+                            f"SKIP whale {whale_name}: model confidence te laag "
+                            f"({model_p*100:.0f}% < {MIN_MODEL_AGREEMENT*100:.0f}%) | {t.title[:45]}"
+                        )
+                        continue
+                    opp_gap = _match.gap  # gebruik echte gap van model
+                else:
+                    opp_gap = 0.0  # markt niet in scanner — geen model oordeel, voorzichtig doorgaan
+            except Exception:
+                opp_gap = 0.0
+
+            # Gap-check: geen whale-follow zonder model-edge bij hoge prijs
+            # gap=0 + entry>0.80 = blind kopiëren met asymmetrisch risico (verlies>winst)
+            MIN_GAP_AT_HIGH_PRICE = 0.05
+            if abs(opp_gap) < MIN_GAP_AT_HIGH_PRICE and current_entry > 0.80:
+                state.add_log(
+                    f"SKIP whale {whale_name}: geen model-edge bij hoge prijs "
+                    f"(gap={opp_gap*100:.1f}%, entry={current_entry*100:.0f}¢) — blind volgen overgeslagen"
+                )
                 continue
 
             # Simuleer of voer uit
@@ -578,9 +689,9 @@ def run_whale_copy():
             opp = _FakeOpp()
             opp.question     = t.title
             opp.direction    = f"BUY {direction}"
-            opp.poly_price   = t.price
-            opp.model_prob   = t.price
-            opp.gap          = 0.0
+            opp.poly_price   = current_entry  # huidige prijs, niet whale entry
+            opp.model_prob   = t.price        # whale entry als proxy voor model kans
+            opp.gap          = opp_gap        # echte gap van eigen model (0.0 als niet beschikbaar)
             opp.condition_id = t.condition_id
             opp.market_id    = ""
             success, note = execute_trade(opp, amount, cfg.dry_run)
@@ -608,7 +719,7 @@ def run_whale_copy():
                     from portfolio import record_trade
                     record_trade(
                         question=t.title, direction=direction,
-                        amount=amount, entry_price=entry_price,
+                        amount=amount, entry_price=current_entry,
                         model_prob=t.price, gap=0.0,
                         condition_id=t.condition_id, market_id="",
                         note=f"[WHALE:{whale_name}:{conviction}]",
@@ -670,6 +781,19 @@ def run_scan_and_trade():
         state.status = "error"
         state.add_log(f"Scan fout: {e}")
         return
+
+    # ── METAR lock scan (aparte hoge-confidence strategie) ────────────────────
+    try:
+        from weather_scanner import scan_metar_lock
+        lock_opps = scan_metar_lock()
+        if lock_opps:
+            state.add_log(f"METAR lock: {len(lock_opps)} kansen gevonden")
+            for opp in lock_opps:
+                # Direct uitvoeren — hoge confidence, minimale gap-filter (8%)
+                if abs(opp.gap) >= 0.08 and state.budget_left > 1:
+                    execute_trade(opp, cfg)
+    except Exception as e:
+        state.add_log(f"METAR lock fout (niet kritiek): {e}")
 
     filtered = [o for o in opportunities if abs(o.gap) >= cfg.min_gap]
     state.add_log(f"Scan klaar — {len(opportunities)} kansen, {len(filtered)} >= {cfg.min_gap*100:.0f}% gap")
@@ -798,7 +922,7 @@ def run_scan_and_trade():
 # ── Achtergrond thread ────────────────────────────────────────────────────────
 
 _stop_event = threading.Event()
-_thread: threading.Thread | None = None
+_thread: Optional[threading.Thread] = None
 
 
 def _worker():
@@ -817,10 +941,14 @@ def _worker():
         next_dt = datetime.now(timezone.utc)
         state.last_scan = next_dt.strftime("%H:%M:%S")
         from datetime import timedelta
-        next_t = next_dt + timedelta(seconds=state.config.scan_interval)
+
+        # Dynamische scan frequentie: 3 min tussen 07:00-10:00 UTC (nieuwe markten verschijnen 's ochtends)
+        local_hour = datetime.now().hour
+        interval = 180 if 7 <= local_hour < 10 else state.config.scan_interval
+        next_t = next_dt + timedelta(seconds=interval)
         state.next_scan = next_t.strftime("%H:%M:%S")
 
-        _stop_event.wait(timeout=state.config.scan_interval)
+        _stop_event.wait(timeout=interval)
 
     state.add_log("Auto trader gestopt")
     state.running = False

@@ -40,6 +40,13 @@ MIN_ENTRY_SEC  = 15      # minimaal zoveel seconden voor sluiting om te kunnen i
 MAX_ENTRY_SEC  = 90      # maximaal zoveel seconden voor sluiting (anders te vroeg)
 DRY_RUN        = True    # altijd dry run tenzij expliciet uitgezet
 
+# Reversal configuratie
+REVERSAL_MIN_PRICE    = 0.10   # minimaal 10¢ entry voor verliezende kant
+REVERSAL_MAX_PRICE    = 0.40   # maximaal 40¢ entry
+REVERSAL_AMOUNT       = 8.0    # iets kleiner bedrag dan momentum (hoger risico)
+MIN_MOVE_FOR_REVERSAL = 50.0   # minimale BTC move in $ voor reversal
+REVERSAL_SIGNAL_TTL   = 300    # reversal mag max 5 min na momentum signal
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -72,6 +79,16 @@ class MomentumTrade:
     note: str = ""
     pnl: float = 0.0
     status: str = "open"
+    strategy: str = "momentum"   # "momentum" of "reversal"
+
+
+@dataclass
+class ReversalSignal:
+    direction: str       # te kopen richting (TEGENGESTELD aan momentum)
+    orig_direction: str  # originele momentum richting
+    move_usd: float      # grootte van de originele BTC move
+    ts: str
+    ts_unix: float       # voor TTL check
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -85,7 +102,9 @@ class BtcMomentumState:
         self.last_btc_price: float = 0.0
         self.trades: list[MomentumTrade] = []
         self.log_entries: list[str] = []
-        self.traded_this_window: str = ""   # "HH:MM" van het 5-min window
+        self.traded_this_window: str = ""      # "HH:MM" van het 5-min window
+        self.last_reversal_signal: Optional[ReversalSignal] = None
+        self.reversal_traded_this_window: str = ""
         self._lock = threading.Lock()
         self._ws: Optional[websocket.WebSocketApp] = None
 
@@ -104,16 +123,25 @@ class BtcMomentumState:
         closed = wins + losses
         wr     = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
         pnl    = round(sum(t.pnl for t in closed), 2)
+
+        rev_trades = [t for t in self.trades if t.strategy == "reversal"]
+        rev_wins   = [t for t in rev_trades if t.status == "won"]
+        rev_closed = [t for t in rev_trades if t.status in ("won", "lost", "sold")]
+        rev_wr     = round(len(rev_wins) / len(rev_closed) * 100, 1) if rev_closed else 0.0
+
         return {
-            "running":     self.running,
-            "dry_run":     self.dry_run,
-            "btc_price":   self.last_btc_price,
-            "last_signal": self.last_signal.__dict__ if self.last_signal else None,
+            "running":      self.running,
+            "dry_run":      self.dry_run,
+            "btc_price":    self.last_btc_price,
+            "last_signal":  self.last_signal.__dict__ if self.last_signal else None,
+            "last_reversal": self.last_reversal_signal.__dict__ if self.last_reversal_signal else None,
             "trades_today": len([t for t in self.trades
                                  if t.ts[:10] == datetime.now(timezone.utc).strftime("%Y-%m-%d")]),
             "total_trades": len(self.trades),
             "win_rate":     wr,
             "total_pnl":    pnl,
+            "reversal_trades": len(rev_trades),
+            "reversal_win_rate": rev_wr,
             "log":          self.log_entries[:20],
         }
 
@@ -150,6 +178,70 @@ def check_momentum(candles: list[Candle]) -> Optional[MomentumSignal]:
     if downs == 4:
         move = round(last4[0].open - last4[-1].close, 2)
         return MomentumSignal("DOWN", 4, move, datetime.now(timezone.utc).strftime("%H:%M:%S"))
+
+    return None
+
+
+# ── Reversal detectie ────────────────────────────────────────────────────────
+
+def check_reversal(
+    candles: list[Candle],
+    last_signal: Optional[MomentumSignal],
+) -> Optional[ReversalSignal]:
+    """
+    Detecteer reversal kans: na een sterke 4-candle streak,
+    signaleert de eerste tegengestelde candle ('dead price') een reversal.
+
+    Voorwaarden:
+    - Er was een recente momentum signal (< REVERSAL_SIGNAL_TTL seconden geleden)
+    - De move was groot genoeg (>= MIN_MOVE_FOR_REVERSAL)
+    - De laatste gesloten candle gaat TEGEN de richting van het momentum
+    """
+    if not last_signal:
+        return None
+
+    # TTL check: signal mag niet te oud zijn
+    try:
+        signal_ts = datetime.strptime(last_signal.ts, "%H:%M:%S").replace(
+            year=datetime.now().year,
+            month=datetime.now().month,
+            day=datetime.now().day,
+            tzinfo=timezone.utc,
+        )
+        age = (datetime.now(timezone.utc) - signal_ts).total_seconds()
+        if age > REVERSAL_SIGNAL_TTL:
+            return None
+    except Exception:
+        return None
+
+    # Move groot genoeg?
+    if abs(last_signal.move_usd) < MIN_MOVE_FOR_REVERSAL:
+        return None
+
+    closed = [c for c in candles if c.closed]
+    if len(closed) < 5:
+        return None
+
+    last = closed[-1]
+    is_down_candle = last.close < last.open
+    is_up_candle   = last.close > last.open
+
+    if last_signal.direction == "UP" and is_down_candle:
+        return ReversalSignal(
+            direction    = "DOWN",
+            orig_direction = "UP",
+            move_usd     = last_signal.move_usd,
+            ts           = datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            ts_unix      = time.time(),
+        )
+    if last_signal.direction == "DOWN" and is_up_candle:
+        return ReversalSignal(
+            direction    = "UP",
+            orig_direction = "DOWN",
+            move_usd     = last_signal.move_usd,
+            ts           = datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            ts_unix      = time.time(),
+        )
 
     return None
 
@@ -240,7 +332,7 @@ def _execute_trade(market: dict, direction: str, dry_run: bool) -> tuple[bool, s
 
     try:
         from auto_trader import get_clob_client
-        from py_clob_client.clob_types import MarketOrderArgs
+        from py_clob_client_v2.clob_types import MarketOrderArgs
 
         client = get_clob_client()
         order  = client.create_market_order(MarketOrderArgs(token_id=token_id, amount=TRADE_AMOUNT))
@@ -351,6 +443,94 @@ def _check_and_trade():
             pass
 
 
+# ── Reversal trade logica ─────────────────────────────────────────────────────
+
+def _check_and_trade_reversal():
+    """
+    Controleer reversal kans en trade als:
+    1. Er een recente momentum signal was
+    2. De huidige candle de richting breekt
+    3. De verliezende kant 10-40¢ noteert op Polymarket
+    """
+    signal = check_reversal(_state.candles, _state.last_signal)
+
+    if not signal:
+        return
+
+    _state.last_reversal_signal = signal
+
+    # Niet twee keer in hetzelfde 5-min window
+    window = _current_5min_window()
+    if window == _state.reversal_traded_this_window:
+        return
+
+    _state.add_log(
+        f"Reversal {signal.direction} — na {signal.orig_direction} move "
+        f"${signal.move_usd:+.0f} — zoek markt 10-40¢..."
+    )
+
+    # Zoek markt: verliezende kant moet 10-40¢ zijn
+    market = find_btc_market(signal.direction)
+    if not market:
+        _state.add_log(f"Reversal: geen markt gevonden ({signal.direction})")
+        return
+
+    price = _get_market_price(market, signal.direction)
+
+    # Harde prijsfilter: 10-40¢
+    if not (REVERSAL_MIN_PRICE <= price <= REVERSAL_MAX_PRICE):
+        _state.add_log(
+            f"Reversal SKIP: {signal.direction} prijs {price*100:.0f}¢ "
+            f"buiten 10-40¢ range"
+        )
+        return
+
+    title   = market.get("question", "?")
+    cond_id = market.get("conditionId", "")
+
+    success, note, entry_price = _execute_trade(market, signal.direction, _state.dry_run)
+
+    trade = MomentumTrade(
+        ts           = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        direction    = signal.direction,
+        amount       = REVERSAL_AMOUNT if success else 0.0,
+        entry_price  = entry_price,
+        question     = title,
+        condition_id = cond_id,
+        dry_run      = _state.dry_run,
+        success      = success,
+        note         = f"[REVERSAL na {signal.orig_direction}] {note}",
+        strategy     = "reversal",
+    )
+
+    with _state._lock:
+        _state.trades.append(trade)
+        if success:
+            _state.reversal_traded_this_window = window
+
+    icon = "✓" if success else "✗"
+    _state.add_log(
+        f"{icon} [REVERSAL] {signal.direction} ${REVERSAL_AMOUNT:.0f} "
+        f"@ {entry_price*100:.0f}¢ | {title[:45]}"
+    )
+
+    if success:
+        _record_trade(trade)
+
+        try:
+            from telegram_bot import send
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "").split(",")[0].strip()
+            dry_tag = "[DRY] " if _state.dry_run else ""
+            send(chat_id,
+                f"↩️ {dry_tag}<b>BTC Reversal</b> — {signal.direction}\n"
+                f"• Na: {signal.orig_direction} move ${signal.move_usd:+.0f}\n"
+                f"• Entry: {entry_price*100:.0f}¢ (verliezende kant)\n"
+                f"• {title[:60]}"
+            )
+        except Exception:
+            pass
+
+
 # ── Binance WebSocket ─────────────────────────────────────────────────────────
 
 def _on_message(ws, message):
@@ -371,6 +551,7 @@ def _on_message(ws, message):
 
         if candle.closed:
             _check_and_trade()
+            _check_and_trade_reversal()
 
     except Exception as e:
         log.warning(f"WS parse fout: {e}")

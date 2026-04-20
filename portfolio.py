@@ -394,7 +394,7 @@ def get_stats() -> dict:
         "unrealized_pnl":   round(p.unrealized_pnl, 3),
         "total_pnl":        round(p.total_pnl, 3),
         "total_pnl_pct":    round(p.total_pnl / p.starting_balance * 100, 1),
-        "trade_count":      p.trade_count,
+        "trade_count":      len(closed_pos) + len(open_pos),
         "open_positions":   len(open_pos),
         "closed_positions": len(closed_pos),
         "wins":             len(wins),

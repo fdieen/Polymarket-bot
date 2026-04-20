@@ -1242,6 +1242,7 @@ HTML = """<!DOCTYPE html>
   <div class="tab" onclick="setTab('momentum', this)">⚡ BTC MOMENTUM</div>
   <div class="tab" onclick="setTab('wallets', this)">WALLETS</div>
   <div class="tab" onclick="setTab('whalefeed', this)">WHALE FEED</div>
+  <div class="tab" onclick="setTab('flow', this)">FLOW</div>
   <div class="tab" onclick="setTab('markten', this)">MARKTEN</div>
   <div class="tab" onclick="setTab('auto', this)">AUTO</div>
   <div class="tab" onclick="setTab('settings', this)">INSTELLINGEN</div>
@@ -1352,6 +1353,35 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <!-- MARKTEN panel -->
+  <!-- Flow Scanner Panel -->
+  <div id="flow-panel" style="display:none">
+    <div class="scanner-header">
+      <div>
+        <div class="scanner-title">SMART MONEY FLOW</div>
+        <div class="scanner-sub" id="flow-sub">Gecoördineerde wallets op dezelfde markt — mogelijk insider of sterke conviction</div>
+      </div>
+      <button class="scan-btn" onclick="loadFlowSignals()">⟳ REFRESH</button>
+    </div>
+
+    <!-- Stats row -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px">
+      <div class="stat-card" style="padding:12px"><div class="stat-label">SIGNALEN VANDAAG</div><div class="stat-val" id="flow-count">—</div></div>
+      <div class="stat-card" style="padding:12px"><div class="stat-label">LAATSTE SIGNAAL</div><div class="stat-val" id="flow-last">—</div></div>
+      <div class="stat-card" style="padding:12px"><div class="stat-label">GROOTSTE FLOW</div><div class="stat-val" id="flow-biggest">—</div></div>
+      <div class="stat-card" style="padding:12px"><div class="stat-label">TOP CATEGORIE</div><div class="stat-val" id="flow-topcat">—</div></div>
+    </div>
+
+    <!-- Signals table -->
+    <div style="background:var(--panel2);border:1px solid var(--border);border-radius:6px;overflow:hidden">
+      <div style="display:grid;grid-template-columns:2fr 90px 60px 60px 70px 90px 80px 70px 50px;gap:0;padding:8px 12px;border-bottom:1px solid var(--border);font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.08em">
+        <div>Markt</div><div>Type</div><div>Richting</div><div>Prijs</div><div>Wallets</div><div>Flow</div><div>Categorie</div><div>Tijd</div><div></div>
+      </div>
+      <div id="flow-list" style="font-size:12px">
+        <div style="padding:24px;text-align:center;color:var(--text2)">Laden...</div>
+      </div>
+    </div>
+  </div>
+
   <div id="markten-panel" style="display:none">
 
     <!-- Stats bar -->
@@ -1603,8 +1633,8 @@ HTML = """<!DOCTYPE html>
 <div class="weer-panel" id="portfolio-panel" style="display:none">
   <div class="scanner-header">
     <div>
-      <div class="scanner-title">PAPER PORTFOLIO</div>
-      <div class="scanner-sub" id="portfolio-sub">Virtueel account — gesimuleerde trades bijhouden</div>
+      <div class="scanner-title">WEATHER PORTFOLIO</div>
+      <div class="scanner-sub" id="portfolio-sub">Automatische trades bijhouden</div>
     </div>
     <div style="display:flex;gap:8px">
       <button class="scan-btn" onclick="refreshPortfolio()">⟳ REFRESH</button>
@@ -1915,6 +1945,7 @@ function setTab(tab, el) {
   const isMomentum   = tab === 'momentum';
   const isWallets    = tab === 'wallets';
   const isWhaleFeed  = tab === 'whalefeed';
+  const isFlow       = tab === 'flow';
   const isMarkten    = tab === 'markten';
   const isAuto       = tab === 'auto';
   const isSettings   = tab === 'settings';
@@ -1925,6 +1956,7 @@ function setTab(tab, el) {
   document.getElementById('momentum-panel').style.display   = isMomentum  ? 'block' : 'none';
   document.getElementById('wallets-panel').style.display    = isWallets   ? 'block' : 'none';
   document.getElementById('whalefeed-panel').style.display  = isWhaleFeed ? 'block' : 'none';
+  document.getElementById('flow-panel').style.display       = isFlow      ? 'block' : 'none';
   document.getElementById('markten-panel').style.display    = isMarkten   ? 'block' : 'none';
   document.getElementById('auto-panel').style.display       = isAuto      ? 'block' : 'none';
   document.getElementById('settings-panel').style.display   = isSettings  ? 'block' : 'none';
@@ -1950,6 +1982,7 @@ function setTab(tab, el) {
       refreshEquityCurve();
     }, 400);
   }
+  if (isFlow)      setTimeout(loadFlowSignals, 400);
   if (isAuto)      setTimeout(refreshAutoStatus, 400);
   if (isSettings)  setTimeout(loadSettings, 400);
   if (isMarkten) {
@@ -1959,6 +1992,59 @@ function setTab(tab, el) {
   }
 }
 
+
+async function loadFlowSignals() {
+  document.getElementById('flow-sub').textContent = 'Ophalen...';
+  try {
+    const r = await fetch('/api/flow-signals');
+    const d = await r.json();
+    const signals = d.signals || [];
+
+    document.getElementById('flow-count').textContent = signals.length;
+    document.getElementById('flow-last').textContent  = signals.length ? signals[0].last : '—';
+    document.getElementById('flow-biggest').textContent = signals.length
+      ? '$' + Math.max(...signals.map(s => s.total_size)).toLocaleString('nl', {maximumFractionDigits:0})
+      : '—';
+    const cats = {};
+    signals.forEach(s => cats[s.category] = (cats[s.category]||0)+1);
+    const topCat = Object.entries(cats).sort((a,b)=>b[1]-a[1])[0];
+    document.getElementById('flow-topcat').textContent = topCat ? topCat[0].toUpperCase() : '—';
+
+    const list = document.getElementById('flow-list');
+    if (!signals.length) {
+      list.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text2)">Nog geen signalen — scanner draait elke 5 minuten.</div>';
+      document.getElementById('flow-sub').textContent = 'Geen signalen gevonden';
+      return;
+    }
+
+    const catColor  = {sports:'var(--go)', crypto:'var(--ice)', politics:'var(--warn)', weather:'#a78bfa', other:'var(--text2)'};
+    const typeColor = {PROACTIEF:'var(--go)', REACTIEF:'var(--warn)', ONBEKEND:'var(--text2)'};
+    const typeIcon  = {PROACTIEF:'🧠', REACTIEF:'⚡', ONBEKEND:'❓'};
+    list.innerHTML = signals.map(s => {
+      const col     = catColor[s.category]    || 'var(--text2)';
+      const tcol    = typeColor[s.signal_type] || 'var(--text2)';
+      const ticon   = typeIcon[s.signal_type]  || '';
+      const dir     = s.outcome === 'Yes' ? '<span style="color:var(--go)">YES</span>' : '<span style="color:var(--danger)">NO</span>';
+      const link    = s.url ? `<a href="${s.url}" target="_blank" style="color:var(--ice);font-size:10px">→</a>` : '';
+      const pricePre = s.price_before ? `<span style="color:var(--text2);font-size:10px"> (was ${(s.price_before*100).toFixed(0)}%)</span>` : '';
+      return `<div style="display:grid;grid-template-columns:2fr 90px 60px 60px 70px 90px 80px 70px 50px;gap:0;padding:10px 12px;border-bottom:1px solid var(--border);align-items:center">
+        <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)">${s.title}</div>
+        <div style="color:${tcol};font-weight:700;font-size:11px">${ticon} ${s.signal_type}</div>
+        <div>${dir}</div>
+        <div style="color:var(--text2)">${(s.price*100).toFixed(0)}%${pricePre}</div>
+        <div style="color:var(--text);font-weight:700">${s.wallets}</div>
+        <div style="color:var(--go);font-weight:700">$${s.total_size.toLocaleString('nl',{maximumFractionDigits:0})}</div>
+        <div style="color:${col}">${s.category.toUpperCase()}</div>
+        <div style="color:var(--text2);font-size:11px">${s.first}→${s.last}</div>
+        <div>${link}</div>
+      </div>`;
+    }).join('');
+
+    document.getElementById('flow-sub').textContent = `${signals.length} signalen — laatste scan ${d.last_scan || ''}`;
+  } catch(e) {
+    document.getElementById('flow-list').innerHTML = `<div style="padding:16px;color:var(--danger)">Fout: ${e}</div>`;
+  }
+}
 
 async function runSportsScan() {
   const btn  = document.getElementById('scan-btn');
@@ -4008,10 +4094,13 @@ def _calc_portfolio_metrics(positions: list) -> dict:
     var_idx    = max(int(n * 0.05) - 1, 0)
     var_95     = round(sorted_ret[var_idx] * 100, 1)   # in %
 
-    # ── Kelly criterion ───────────────────────────────────────────────────
-    wins_lst   = [p for p in all_trades if p.get("pnl", 0) > 0]
-    losses_lst = [p for p in all_trades if p.get("pnl", 0) < 0]
-    win_rate_k = len(wins_lst) / n
+    # ── Kelly criterion — alleen op closed trades (won/lost/sold) ─────────
+    closed_for_kelly = [p for p in all_trades if p.get("status") in ("won", "lost", "sold")]
+    if not closed_for_kelly:
+        closed_for_kelly = all_trades   # fallback als er geen closed zijn
+    wins_lst   = [p for p in closed_for_kelly if p.get("pnl", 0) > 0]
+    losses_lst = [p for p in closed_for_kelly if p.get("pnl", 0) < 0]
+    win_rate_k = len(wins_lst) / max(len(closed_for_kelly), 1)
     if wins_lst and losses_lst:
         avg_win  = sum(p["pnl"] / p["amount"] for p in wins_lst) / len(wins_lst)
         avg_loss = sum(abs(p["pnl"] / p["amount"]) for p in losses_lst) / len(losses_lst)
@@ -5114,9 +5203,9 @@ def api_trade():
         return jsonify({"ok": False, "error": ".env niet ingesteld — run setup_keys.py"}), 400
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import MarketOrderArgs, ApiCreds
-        from py_clob_client.constants import POLYGON
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import MarketOrderArgs, ApiCreds
+        from py_clob_client_v2.constants import POLYGON
 
         client = ClobClient(
             host="https://clob.polymarket.com",
@@ -5143,6 +5232,19 @@ def api_trade():
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/flow-signals")
+def api_flow_signals():
+    """Geeft recente flow scanner signalen terug."""
+    try:
+        import flow_scanner as _fs_module
+        scanner = getattr(_fs_module, '_flow_scanner', None)
+        signals = scanner.recent_signals(50) if scanner else []
+        last_scan = datetime.now(timezone.utc).strftime("%H:%M") if signals else "—"
+        return jsonify({"signals": signals, "last_scan": last_scan})
+    except Exception as e:
+        return jsonify({"signals": [], "last_scan": "—", "error": str(e)})
 
 
 if __name__ == "__main__":
@@ -5181,5 +5283,23 @@ if __name__ == "__main__":
         _btc_start(dry_run=True)
     except Exception as _e:
         print(f"[BTC momentum] start fout: {_e}")
+
+    # Start flow scanner (smart money detector)
+    try:
+        import flow_scanner as _fs_module
+        _fs_module._flow_scanner = _fs_module.FlowScanner()
+        _fs_module._flow_scanner.start()
+        print("[Flow scanner] gestart")
+    except Exception as _e:
+        print(f"[Flow scanner] start fout: {_e}")
+
+    # Start weather scanner (achtergrond polling + alerts)
+    try:
+        import weather_scanner as _ws_module
+        _ws_module._weather_scanner = _ws_module.WeatherScanner()
+        _ws_module._weather_scanner.start()
+        print("[Weather scanner] gestart")
+    except Exception as _e:
+        print(f"[Weather scanner] start fout: {_e}")
 
     app.run(debug=False, port=8080, host="0.0.0.0", threaded=True)

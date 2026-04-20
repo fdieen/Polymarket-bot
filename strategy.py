@@ -10,8 +10,8 @@ Logica:
 import os
 import requests
 from dataclasses import dataclass
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs
 BUY  = "BUY"
 SELL = "SELL"
 

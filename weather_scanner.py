@@ -13,6 +13,7 @@ Run: venv/bin/python weather_scanner.py
 import json
 import re
 import requests
+from typing import Optional
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -28,6 +29,15 @@ MIN_VOLUME = 50.0   # minimaal $50/dag volume — illiquide markten hebben slech
 # YES-bets op lage prijzen (<20%) zijn historisch verliesgevend: 0W/1L (-$20)
 # Daarom extra filter: alleen YES als poly_price >= 0.20
 MIN_YES_PRICE = 0.20
+
+# Tropische steden: stabiel warm weer maakt model minder betrouwbaar (6 van 14 verliesgevende trades)
+# Hogere drempel vereist om false positives te vermijden
+TROPICAL_CITIES = {
+    "kuala lumpur", "singapore", "panama city", "mumbai", "bangkok",
+    "jakarta", "manila", "ho chi minh", "colombo", "dhaka",
+    "miami",  # 3W/2L historisch — tropisch klimaat met hoge dagelijkse variatie
+}
+TROPICAL_MIN_GAP = 0.55  # 55% gap vereist voor tropische steden (vs 35% normaal)
 
 # Steden → coördinaten
 CITIES = {
@@ -74,7 +84,7 @@ CITIES = {
     "san francisco": (37.774,-122.419),
     "santiago":      (-33.457, -70.648),
     "sao paulo":     (-23.550, -46.633),
-    "seoul":         (37.566, 126.978),
+    "seoul":         (37.558, 126.791),  # Polymarket: Incheon (RKSS)
     "shanghai":      (31.228, 121.474),
     "singapore":     (1.352,  103.820),
     "stockholm":     (59.329,  18.069),
@@ -113,6 +123,8 @@ class WeatherOpportunity:
     market_id:         str   = ""
     model_shift:       float = 0.0
     consistency_bonus: float = 0.0
+    source_agreement:  float = 1.0   # 0.0–1.0: mate van overeenstemming tussen bronnen
+    source_probs:      str   = ""    # debug: "model=0.08 mos=0.12 climo=0.09"
 
     def label(self):
         if abs(self.gap) >= 0.30: return "STERK"
@@ -120,7 +132,7 @@ class WeatherOpportunity:
         return "ZWAK"
 
 
-def parse_temperature_question(question: str) -> dict | None:
+def parse_temperature_question(question: str) -> Optional[dict]:
     """
     Parst een Polymarket temperatuurvraag.
     Ondersteunde formaten:
@@ -196,7 +208,7 @@ def parse_temperature_question(question: str) -> dict | None:
     return None
 
 
-def fetch_forecast_full(city: str, date: str) -> dict | None:
+def fetch_forecast_full(city: str, date: str) -> Optional[dict]:
     """
     Haalt alle relevante weerdata op voor een stad op een datum.
     Returns dict met temp_max, temp_min, precip_mm, precip_pct, wind_max, weathercode.
@@ -239,13 +251,13 @@ def fetch_forecast_full(city: str, date: str) -> dict | None:
     return None
 
 
-def fetch_forecast_temp(city: str, date: str) -> float | None:
+def fetch_forecast_temp(city: str, date: str) -> Optional[float]:
     """Backwards-compat wrapper."""
     result = fetch_forecast_full(city, date)
     return result["temp_max"] if result else None
 
 
-def fetch_all_city_temps(date: str | None = None) -> dict:
+def fetch_all_city_temps(date: Optional[str] = None) -> dict:
     """
     Haalt huidige max-temperatuur (vandaag) op voor ALLE steden.
     Gebruikt voor de heatmap. Returns {city: temp_c}.
@@ -321,6 +333,38 @@ def model_probability(forecast_c: float, parsed: dict, spread: float = 2.0, days
     return 0.5
 
 
+def _resolve_condition_id(market: dict) -> str:
+    """Geeft conditionId terug. Als Gamma het niet meestuurt, haal het op via CLOB."""
+    cid = market.get("conditionId", "")
+    if cid:
+        return cid
+    # Fallback: CLOB API via slug
+    slug = market.get("slug", "")
+    if slug:
+        try:
+            r = requests.get(f"https://clob.polymarket.com/markets/{slug}", timeout=6)
+            if r.status_code == 200:
+                return r.json().get("condition_id", "")
+        except Exception:
+            pass
+    # Fallback: CLOB API via market_id (event markets endpoint)
+    mid = str(market.get("id", ""))
+    if mid:
+        try:
+            r = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"id": mid},
+                timeout=6,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and data:
+                    return data[0].get("conditionId", "")
+        except Exception:
+            pass
+    return ""
+
+
 def fetch_temperature_markets() -> list[dict]:
     """Haalt actieve temperatuurmarkten op van Polymarket.
     Scant max 10 pagina's (5000 markten) parallel voor snelheid."""
@@ -350,13 +394,19 @@ def fetch_temperature_markets() -> list[dict]:
         for future in as_completed(futures):
             results.extend(future.result())
 
-    # Dedupliceer op conditionId
-    seen = set()
+    # Dedupliceer op conditionId én vraagtekst (beide checks — conditionId kan leeg zijn)
+    seen_cid = set()
+    seen_q = set()
     unique = []
     for m in results:
-        cid = m.get("conditionId", m.get("question", ""))
-        if cid not in seen:
-            seen.add(cid)
+        cid = m.get("conditionId", "")
+        q = m.get("question", "")
+        if (cid and cid in seen_cid) or (q and q in seen_q):
+            continue
+        if cid:
+            seen_cid.add(cid)
+        if q:
+            seen_q.add(q)
             unique.append(m)
     return unique
 
@@ -450,7 +500,117 @@ def scan() -> list[WeatherOpportunity]:
         except Exception:
             days_ahead = 4
 
-        model_prob = model_probability(forecast_c, parsed, spread=spread, days_ahead=days_ahead)
+        raw_model_prob = model_probability(forecast_c, parsed, spread=spread, days_ahead=days_ahead)
+        model_prob     = raw_model_prob
+        _climo_prob: Optional[float] = None
+        _mos_prob:   Optional[float] = None
+        _ens_prob:   Optional[float] = None
+
+        # ── Klimatologie blending (historische verdeling als prior) ──────────
+        try:
+            from climatology import climo_probability, blend_with_climo
+            city_lower = parsed["city"].lower()
+            coords = CITIES.get(city_lower)
+            if coords:
+                _climo_prob = climo_probability(
+                    city=city_lower,
+                    date_str=parsed["date"],
+                    parsed=parsed,
+                    lat=coords[0],
+                    lon=coords[1],
+                )
+                if _climo_prob is not None:
+                    model_prob = blend_with_climo(model_prob, _climo_prob, days_ahead)
+        except Exception:
+            pass
+
+        # ── GFS-MOS blending (alleen dag 1-5, US/EU vliegvelden) ────────────
+        try:
+            from mos import get_mos_forecast, mos_probability, blend_mos
+            mos_fc = get_mos_forecast(parsed["city"].lower(), parsed["date"])
+            if mos_fc is not None:
+                _mos_prob = mos_probability(mos_fc, parsed)
+                if _mos_prob is not None:
+                    model_prob = blend_mos(model_prob, _mos_prob, days_ahead)
+        except Exception:
+            pass
+
+        # ── Ensemble P(YES): directe kansbepaling uit member verdeling ────────
+        # Nauwkeuriger dan consensus+normale verdeling: empirisch tellen
+        # welk percentage van de 40-51 ensemble members de conditie haalt.
+        _ens_prob: Optional[float] = None
+        try:
+            from weather_sources import ensemble_probability
+            lo_c  = to_celsius(parsed["temp_low"],  parsed["unit"])
+            hi_c  = to_celsius(parsed["temp_high"], parsed["unit"])
+            _ens_prob = ensemble_probability(
+                city      = parsed["city"].lower(),
+                date      = parsed["date"],
+                temp_low_c = lo_c,
+                temp_high_c= hi_c,
+                condition  = parsed["condition"],
+                temp_type  = parsed.get("temp_type", "high"),
+            )
+            if _ens_prob is not None:
+                # Gewicht: dag 1-3: 40% ensemble (meest betrouwbaar dichtbij)
+                #          dag 4-6: 35%, dag 7+: 25%
+                if days_ahead <= 3:
+                    w_ens = 0.40
+                elif days_ahead <= 6:
+                    w_ens = 0.35
+                else:
+                    w_ens = 0.25
+                model_prob = round((1 - w_ens) * model_prob + w_ens * _ens_prob, 3)
+        except Exception:
+            pass
+
+        # ── Koudefront detectie ──────────────────────────────────────────────
+        # Actieve fronten verhogen temperatuuronzekerheid → kans richting 0.5 trekken
+        _front_risk: Optional[dict] = None
+        try:
+            from cold_front import get_front_risk, apply_front_risk
+            _front_risk = get_front_risk(
+                city=parsed["city"].lower(),
+                date_str=parsed["date"],
+                lat=lat,
+                lon=lon,
+            )
+            if _front_risk and _front_risk["risk"] >= 0.40:
+                model_prob = apply_front_risk(model_prob, poly_price, _front_risk, parsed)
+        except Exception:
+            pass
+
+        # ── Source agreement score ────────────────────────────────────────────
+        # Meet hoeveel bronnen het eens zijn over de richting (YES/NO) en
+        # hoe dicht ze bij elkaar zitten. Hogere agreement → grotere positie.
+        _source_probs = [raw_model_prob]
+        if _climo_prob is not None: _source_probs.append(_climo_prob)
+        if _mos_prob   is not None: _source_probs.append(_mos_prob)
+        if _ens_prob   is not None: _source_probs.append(_ens_prob)
+
+        if len(_source_probs) >= 2:
+            # Richting-overeenstemming: alle bronnen aan dezelfde kant van poly_price?
+            directions = [p > poly_price for p in _source_probs]
+            all_agree  = all(directions) or not any(directions)
+            # Spreiding: kleinere spread = hogere zekerheid
+            spread_sources = max(_source_probs) - min(_source_probs)
+            spread_score   = max(0.0, 1.0 - spread_sources / 0.30)  # 0% spread=1.0, 30%=0.0
+            agreement = (1.0 if all_agree else 0.4) * spread_score
+        else:
+            agreement = 0.5  # maar één bron beschikbaar
+
+        # Frontrisico verlaagt agreement (hogere onzekerheid = kleiner positie)
+        if _front_risk and _front_risk["risk"] >= 0.40:
+            front_penalty = _front_risk["risk"] * 0.30  # max -30% agreement bij risk=1.0
+            agreement = max(0.0, agreement - front_penalty)
+
+        _src_debug = (
+            f"model={raw_model_prob:.2f}"
+            + (f" climo={_climo_prob:.2f}" if _climo_prob is not None else "")
+            + (f" mos={_mos_prob:.2f}"     if _mos_prob   is not None else "")
+            + (f" ens={_ens_prob:.2f}"     if _ens_prob   is not None else "")
+            + (f" front={_front_risk['risk']:.2f}({_front_risk['type'][:4]})" if _front_risk and _front_risk["risk"] >= 0.40 else "")
+        )
 
         # ── Seasonal ensemble blending (voor markten > 7 dagen vooruit) ──────
         # Bij lange horizons verliest het deterministische model voorspelkracht.
@@ -505,7 +665,21 @@ def scan() -> list[WeatherOpportunity]:
         else:
             boundary_factor = 1.0
 
-        effective_min_gap = MIN_GAP * consensus_factor * boundary_factor
+        # Gap drempel per markttype — gebaseerd op historische win rates
+        # "or higher/lower": 2W/3L = 40% → drempel fors hoger
+        # "between": 12W/1L = 92% → lage drempel volstaat
+        # Tropisch penalty wordt NA markttype toegepast (neem de hoogste)
+        condition_type = parsed.get("condition", "")
+        if condition_type in ("above", "below"):
+            base_gap = 0.65        # or higher/below: 40% win rate → hoge drempel
+        elif condition_type == "between":
+            base_gap = 0.20        # between: 92% win rate → lagere drempel volstaat
+        else:
+            base_gap = MIN_GAP
+        # Tropische steden: drempel verhogen bovenop markttype (neem hoogste waarde)
+        if parsed["city"].lower() in TROPICAL_CITIES:
+            base_gap = max(base_gap, TROPICAL_MIN_GAP)
+        effective_min_gap = base_gap * consensus_factor * boundary_factor
 
         # ── Model shift detectie ─────────────────────────────────────────────
         model_shift_val = 0.0
@@ -540,10 +714,12 @@ def scan() -> list[WeatherOpportunity]:
                 gap=round(gap, 3),
                 direction="BUY YES" if gap > 0 else "BUY NO",
                 volume=volume,
-                condition_id=market.get("conditionId", ""),
+                condition_id=_resolve_condition_id(market),
                 slug=market.get("slug", ""),
                 market_id=str(market.get("id", "")),
                 model_shift=model_shift_val,
+                source_agreement=round(agreement, 2),
+                source_probs=_src_debug,
             ))
 
     # ── Consistentie check: monotone kansen per stad/datum ───────────────────
@@ -676,6 +852,149 @@ def scan() -> list[WeatherOpportunity]:
         ))
 
     opportunities = sorted(opportunities, key=lambda o: abs(o.gap) + o.consistency_bonus, reverse=True)
+
+    return opportunities
+
+
+def scan_metar_lock() -> list[WeatherOpportunity]:
+    """
+    METAR Lock strategie: na ~14h lokaal staat de dagmax grotendeels vast.
+
+    Vergelijkt de gemeten dagmax (via METAR history, dezelfde bron als Wunderground/Polymarket)
+    met open markten voor vandaag. Als de dagmax al duidelijk buiten een bucket valt,
+    is de uitkomst vrijwel zeker → koop de winnende kant.
+
+    Win rate: ~88% (bron: Kalshi Weather Edge, bevestigd door meerdere traders).
+    Minimale edge: dagmax moet > METAR_LOCK_MARGIN buiten de range liggen.
+    """
+    from weather_sources import get_metar_daymax, CITY_META
+    from datetime import datetime, timezone
+
+    METAR_LOCK_MARGIN_F = 2.0   # dagmax moet min. 2°F buiten range liggen
+    METAR_LOCK_MARGIN_C = 1.0   # of 1°C buiten range
+    MIN_HOUR_UTC        = 14    # pas na 14h UTC (~09-10h lokaal VS oost = vroeg middag)
+    MAX_POLY_PRICE      = 0.92  # markt mag niet al volledig ingeprijsd zijn
+
+    now_utc_hour = datetime.now(timezone.utc).hour
+    if now_utc_hour < MIN_HOUR_UTC:
+        return []   # te vroeg — dagmax niet stabiel genoeg
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    markets = fetch_temperature_markets()
+    today_markets = [
+        m for m in markets
+        if today_str in m.get("question", "")
+        or (m.get("endDate", "") or "")[:10] == today_str
+    ]
+
+    if not today_markets:
+        return []
+
+    opportunities = []
+
+    for market in today_markets:
+        parsed = parse_market(market)
+        if not parsed:
+            continue
+
+        city_lower = parsed["city"].lower()
+        meta = CITY_META.get(city_lower)
+        if not meta:
+            continue
+
+        poly_price = float(
+            market.get("lastTradePrice")
+            or (market.get("outcomePrices") or ["0.5"])[0]
+        )
+        if poly_price <= 0.01 or poly_price >= MAX_POLY_PRICE:
+            continue   # al bijna zeker of geen liquide prijs
+
+        # Haal dagmax op via METAR history (= Wunderground data)
+        day_obs = get_metar_daymax(city_lower)
+        if not day_obs or day_obs["n_obs"] < 6:
+            continue   # te weinig observaties
+
+        unit    = parsed["unit"]
+        lo      = parsed["temp_low"]
+        hi      = parsed["temp_high"]
+        cond    = parsed["condition"]
+
+        if unit == "F":
+            obs_max = day_obs["day_max_f"]
+            obs_min = day_obs["day_min_f"]
+            margin  = METAR_LOCK_MARGIN_F
+        else:
+            obs_max = day_obs["day_max_c"]
+            obs_min = day_obs["day_min_c"]
+            margin  = METAR_LOCK_MARGIN_C
+
+        temp_type = parsed.get("temp_type", "high")
+        obs_val   = obs_max if temp_type == "high" else obs_min
+
+        # Bepaal of uitkomst al vaststaat
+        lock_direction = None
+        lock_confidence = 0.0
+
+        if cond == "between":
+            if obs_val > hi + margin:
+                lock_direction  = "NO"      # temp al boven range — YES onmogelijk
+                lock_confidence = min(0.97, 0.80 + (obs_val - hi - margin) * 0.05)
+            elif obs_val < lo - margin and temp_type == "high":
+                # Dagmax al < ondergrens — zou kunnen stijgen, alleen lock als ruim eronder
+                if obs_val < lo - margin * 3:
+                    lock_direction  = "NO"
+                    lock_confidence = min(0.92, 0.75 + (lo - obs_val - margin * 3) * 0.04)
+
+        elif cond == "above":
+            if obs_val >= lo:
+                lock_direction  = "YES"     # al boven drempel — YES zeker
+                lock_confidence = min(0.97, 0.85 + (obs_val - lo) * 0.02)
+            elif obs_val < lo - margin * 3:
+                lock_direction  = "NO"
+                lock_confidence = min(0.90, 0.75 + (lo - obs_val - margin * 3) * 0.04)
+
+        elif cond == "below":
+            if obs_val <= hi:
+                lock_direction  = "YES"
+                lock_confidence = min(0.97, 0.85 + (hi - obs_val) * 0.02)
+
+        if lock_direction is None or lock_confidence < 0.75:
+            continue
+
+        # Bereken gap t.o.v. marktprijs
+        if lock_direction == "YES":
+            model_prob = lock_confidence
+            gap        = model_prob - poly_price
+        else:
+            no_price   = 1 - poly_price
+            model_prob = lock_confidence
+            gap        = model_prob - no_price
+
+        if abs(gap) < 0.08:     # minimaal 8% edge
+            continue
+
+        q = market.get("question", "")
+        opportunities.append(WeatherOpportunity(
+            question        = q,
+            city            = parsed["city"].title(),
+            date            = parsed["date"],
+            condition       = cond,
+            temp_low        = lo,
+            temp_high       = hi,
+            unit            = unit,
+            poly_price      = poly_price if lock_direction == "YES" else 1 - poly_price,
+            forecast_temp   = obs_val,
+            model_prob      = model_prob,
+            gap             = gap,
+            direction       = lock_direction,
+            volume          = float(market.get("volume") or 0),
+            condition_id    = _resolve_condition_id(market),
+            slug            = market.get("slug", ""),
+            market_id       = str(market.get("id", "")),
+            source_agreement= lock_confidence,
+            source_probs    = f"metar_lock obs={obs_val:.1f}{unit} conf={lock_confidence:.2f} n_obs={day_obs['n_obs']}",
+        ))
 
     return opportunities
 

@@ -26,6 +26,7 @@ import json as _json
 import pathlib as _pathlib
 import requests
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 OPENMETEO = "https://api.open-meteo.com/v1/forecast"
 AWC_BASE  = "https://aviationweather.gov/api/data"
@@ -40,12 +41,12 @@ CITY_META = {
     "barcelona":     ("LEBL", 41.297,  2.078),
     "beijing":       ("ZBAA", 40.080, 116.585),
     "berlin":        ("EDDB", 52.362, 13.500),
-    "buenos aires":  ("SAEZ",-34.822, -58.535),
+    "buenos aires":  ("SAEZ", -34.822, -58.535),
     "cairo":         ("HECA", 30.122,  31.406),
     "chengdu":       ("ZUUU", 30.578, 103.947),
     "chicago":       ("KORD", 41.978, -87.905),
-    "dallas":        ("KDFW", 32.896, -97.038),
-    "denver":        ("KDEN", 39.856,-104.674),
+    "dallas":        ("KDAL", 32.847, -96.852),   # Polymarket: Love Field, niet DFW
+    "denver":        ("KBKF", 39.717,-104.752),   # Polymarket: Buckley AFB Aurora, niet DEN
     "dubai":         ("OMDB", 25.252,  55.364),
     "helsinki":      ("EFHK", 60.317,  24.963),
     "hong kong":     ("VHHH", 22.309, 113.915),
@@ -56,7 +57,8 @@ CITY_META = {
     "kuala lumpur":  ("WMKK",  2.745, 101.710),
     "lagos":         ("DNMM",  6.577,   3.321),
     "lima":          ("SPJC",-11.975, -77.114),
-    "london":        ("EGLL", 51.477,  -0.461),
+    "houston":       ("KHOU", 29.645, -95.279),    # Polymarket: Hobby Airport, niet IAH
+    "london":        ("EGLC", 51.505,   0.055),    # Polymarket: City Airport, niet Heathrow
     "los angeles":   ("KLAX", 33.943,-118.408),
     "lucknow":       ("VILK", 26.760,  80.889),
     "madrid":        ("LEMD", 40.472,  -3.561),
@@ -67,15 +69,16 @@ CITY_META = {
     "mumbai":        ("VABB", 19.089,  72.868),
     "munich":        ("EDDM", 48.354,  11.786),
     "nairobi":       ("HKJK", -1.319,  36.925),
-    "new york":      ("KJFK", 40.640, -73.778),
+    "new york":      ("KLGA", 40.777, -73.873),    # Polymarket: LaGuardia, niet JFK
+    "new york city": ("KLGA", 40.777, -73.873),    # Polymarket: LaGuardia, niet JFK
     "oslo":          ("ENGM", 60.194,  11.100),
     "panama city":   ("MPTO",  9.071, -79.383),
-    "paris":         ("LFPG", 49.009,   2.548),
+    "paris":         ("LFPB", 48.969,   2.441),    # Polymarket: Le Bourget, niet CDG
     "rome":          ("LIRF", 41.800,  12.239),
     "san francisco": ("KSFO", 37.619,-122.375),
     "santiago":      ("SCEL",-33.393, -70.786),
     "sao paulo":     ("SBGR",-23.435, -46.473),
-    "seoul":         ("RKSI", 37.469, 126.451),
+    "seoul":         ("RKSS", 37.558, 126.791),   # Polymarket: Incheon, niet Gimpo
     "shanghai":      ("ZSPD", 31.144, 121.805),
     "singapore":     ("WSSS",  1.350, 103.994),
     "stockholm":     ("ESSA", 59.652,  17.919),
@@ -91,13 +94,11 @@ CITY_META = {
     "shenzhen":      ("ZGSZ", 22.640, 113.811),
     "tel aviv":      ("LLBG", 32.009,  34.887),
     "wellington":    ("NZWN",-41.327, 174.805),
-    "london":        ("EGLL", 51.477,  -0.461),
-    "milan":         ("LIMC", 45.630,   8.723),
-    "istanbul":      ("LTFM", 41.275,  28.752),
+    "busan":         ("RKPK", 35.179, 128.938),    # Polymarket: Gimhae International
 }
 
 
-def get_metar(city: str) -> dict | None:
+def get_metar(city: str) -> Optional[dict]:
     """
     Actuele luchthavenmeting (geen model — echte sensor).
     Geeft: temp_c, dewpoint_c, wind_kt, wind_dir, obs_time
@@ -132,7 +133,69 @@ def get_metar(city: str) -> dict | None:
         return None
 
 
-def get_taf_summary(city: str) -> dict | None:
+def get_metar_daymax(city: str) -> Optional[dict]:
+    """
+    Haalt de gemeten dagmax (en dagmin) op voor vandaag via uurlijkse METAR-history.
+
+    Dit is dezelfde data die Wunderground toont — de officiële Polymarket resolutiebron.
+    Na ~14h lokaal is de dagmax grotendeels zeker. Dit is de basis van de
+    'METAR lock' strategie (~88% win rate als dagmax duidelijk buiten range ligt).
+
+    Returns dict met:
+      day_max_f / day_max_c : dagmax tot nu toe
+      day_min_f / day_min_c : dagmin tot nu toe
+      n_obs                 : aantal uurlijkse observaties
+      last_obs_time         : tijdstip laatste meting (UTC)
+      hours_since_midnight  : uren verstreken op lokale dag (schatting)
+    """
+    meta = CITY_META.get(city)
+    if not meta:
+        return None
+    icao = meta[0]
+
+    try:
+        r = requests.get(
+            f"{AWC_BASE}/metar",
+            params={"ids": icao, "format": "json", "hours": 24},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data:
+            return None
+
+        temps_f = []
+        last_time = ""
+        for obs in data:
+            temp_c = obs.get("temp")
+            if temp_c is not None:
+                temps_f.append(temp_c * 9 / 5 + 32)
+                t = obs.get("reportTime", "")
+                if t > last_time:
+                    last_time = t
+
+        if not temps_f:
+            return None
+
+        day_max_f = max(temps_f)
+        day_min_f = min(temps_f)
+
+        return {
+            "source":             "METAR-history",
+            "icao":               icao,
+            "day_max_f":          round(day_max_f, 1),
+            "day_max_c":          round((day_max_f - 32) * 5 / 9, 1),
+            "day_min_f":          round(day_min_f, 1),
+            "day_min_c":          round((day_min_f - 32) * 5 / 9, 1),
+            "n_obs":              len(temps_f),
+            "last_obs_time":      last_time,
+        }
+    except Exception:
+        return None
+
+
+def get_taf_summary(city: str) -> Optional[dict]:
     """
     TAF-forecast van een human meteoroloog (24-30h vooruit).
     Geeft: wind_kt, visibility, clouds, valid_from, valid_to
@@ -171,7 +234,7 @@ def get_taf_summary(city: str) -> dict | None:
         return None
 
 
-def get_openmeteo(city: str, date: str, model: str = "best_match") -> dict | None:
+def get_openmeteo(city: str, date: str, model: str = "best_match") -> Optional[dict]:
     """
     Open-Meteo forecast voor een datum.
     model: "best_match" (ECMWF), "gfs_seamless" (GFS), "icon_seamless" (ICON)
@@ -212,7 +275,7 @@ def get_openmeteo(city: str, date: str, model: str = "best_match") -> dict | Non
         return None
 
 
-def get_nws_forecast(city: str, date: str) -> dict | None:
+def get_nws_forecast(city: str, date: str) -> Optional[dict]:
     """
     Officieel Amerikaans NWS-model (weather.gov) — alleen VS-steden.
     Nauwkeuriger dan ECMWF voor binnenlandse VS-locaties.
@@ -246,25 +309,40 @@ def get_nws_forecast(city: str, date: str) -> dict | None:
         periods = r2.json()["properties"]["periods"]
         target  = datetime.strptime(date, "%Y-%m-%d").date()
 
+        day_temp_f  = None
+        night_temp_f = None
+        day_period  = None
+
         for p in periods:
             start = datetime.fromisoformat(p["startTime"]).date()
-            if start == target and p.get("isDaytime", True):
-                temp_f = p["temperature"]
-                temp_c = (temp_f - 32) * 5 / 9
-                return {
-                    "source":       "NWS",
-                    "temp_max":     round(temp_c, 1),
-                    "temp_max_f":   temp_f,
-                    "short_forecast": p.get("shortForecast", ""),
-                    "wind_speed":   p.get("windSpeed", ""),
-                    "icon":         p.get("icon", ""),
-                }
-        return None
+            if start != target:
+                continue
+            if p.get("isDaytime", True) and day_temp_f is None:
+                day_temp_f = p["temperature"]
+                day_period = p
+            elif not p.get("isDaytime", True) and night_temp_f is None:
+                night_temp_f = p["temperature"]
+
+        if day_temp_f is None:
+            return None
+
+        temp_max_c = round((day_temp_f - 32) * 5 / 9, 1)
+        temp_min_c = round((night_temp_f - 32) * 5 / 9, 1) if night_temp_f is not None else None
+
+        return {
+            "source":         "NWS",
+            "temp_max":       temp_max_c,
+            "temp_max_f":     day_temp_f,
+            "temp_min":       temp_min_c,
+            "temp_min_f":     night_temp_f,
+            "short_forecast": day_period.get("shortForecast", "") if day_period else "",
+            "wind_speed":     day_period.get("windSpeed", "") if day_period else "",
+        }
     except Exception:
         return None
 
 
-def get_synoptic(city: str) -> dict | None:
+def get_synoptic(city: str) -> Optional[dict]:
     """
     Synoptic Data — actuele meting van dichtstbijzijnde weerstation (100k+ stations).
     Geeft de meest recente gemeten temperatuur, niet een modelvoorspelling.
@@ -311,7 +389,7 @@ def get_synoptic(city: str) -> dict | None:
         return None
 
 
-def get_tomorrow_io(city: str, date: str) -> dict | None:
+def get_tomorrow_io(city: str, date: str) -> Optional[dict]:
     """
     Tomorrow.io ML-weermodel — nauwkeurigste gratis bron.
     Vereist TOMORROW_API_KEY in .env (gratis: tomorrow.io/signup, 500 calls/dag).
@@ -377,7 +455,7 @@ def _save_mos_cache(cache: dict):
 _mos_cache: dict = _load_mos_cache()
 
 
-def get_seasonal_prob(city: str, date: str, threshold_c: float, condition: str) -> float | None:
+def get_seasonal_prob(city: str, date: str, threshold_c: float, condition: str) -> Optional[float]:
     """
     Berekent P(boven/onder drempel) direct vanuit 50-member seasonal ensemble.
 
@@ -517,71 +595,192 @@ def get_mos_bias(city: str, month: int, lat: float, lon: float) -> float:
     return bias
 
 
-def get_ensemble_spread(city: str, date: str) -> float | None:
+_ENSEMBLE_CACHE_FILE = _pathlib.Path(__file__).parent / "data" / "ensemble_cache.json"
+_ENS_CACHE_TTL_HOURS = 6   # Ensemble modellen updaten elke 6h
+
+
+def _load_ensemble_cache() -> dict:
+    try:
+        if _ENSEMBLE_CACHE_FILE.exists():
+            return _json.loads(_ENSEMBLE_CACHE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_ensemble_cache(cache: dict):
+    try:
+        _pathlib.Path(_ENSEMBLE_CACHE_FILE.parent).mkdir(exist_ok=True)
+        _ENSEMBLE_CACHE_FILE.write_text(_json.dumps(cache))
+    except Exception:
+        pass
+
+
+def _fetch_ensemble_members(lat: float, lon: float, date: str, model: str) -> Optional[list[float]]:
     """
-    Haalt ensemble spread op via Open-Meteo ensemble API.
+    Haalt alle ensemble member dagmaxima op voor één model/locatie/datum.
+    Retourneert gesorteerde lijst van temperaturen (°C) of None bij fout.
+    """
+    try:
+        r = requests.get(
+            "https://ensemble-api.open-meteo.com/v1/ensemble",
+            params={
+                "latitude":      lat,
+                "longitude":     lon,
+                "daily":         "temperature_2m_max,temperature_2m_min",
+                "forecast_days": 16,
+                "timezone":      "auto",
+                "models":        model,
+            },
+            timeout=12,
+        )
+        if r.status_code == 429:
+            return None  # daily rate limit — gebruik cache
+        if r.status_code != 200:
+            return None
 
-    Probeert meerdere ensembles (ICON 40 members, GFS 31, GEM 21) en neemt
-    de gemiddelde P10-P90 spread als beste schatting van modelonzekerheid.
+        data = r.json().get("daily", {})
+        times = data.get("time", [])
+        if date not in times:
+            return None
+        idx = times.index(date)
 
-    Returns: P10-P90 spread in °C of None bij fout.
+        max_members, min_members = [], []
+        for key, vals in data.items():
+            if not isinstance(vals, list) or idx >= len(vals) or vals[idx] is None:
+                continue
+            if "temperature_2m_max_member" in key:
+                max_members.append(vals[idx])
+            elif "temperature_2m_min_member" in key:
+                min_members.append(vals[idx])
+
+        if len(max_members) < 10:
+            return None
+
+        return {"max": sorted(max_members), "min": sorted(min_members) if min_members else []}
+    except Exception:
+        return None
+
+
+def get_ensemble_data(city: str, date: str) -> Optional[dict]:
+    """
+    Haalt gecachede ensemble data op voor stad/datum.
+
+    Cache TTL: 6 uur (ensemble modellen updaten elke 6h).
+    Probeert ECMWF ENS (51 members) eerst, dan ICON (40), GFS (31), GEM (21).
+
+    Returns dict met:
+      max_members  : gesorteerde lijst dagmax per ensemble member (°C)
+      min_members  : gesorteerde lijst dagmin per ensemble member (°C)
+      spread       : P10-P90 spread dagmax (°C) — dynamische sigma
+      p10/p50/p90  : percentielen dagmax
+      n_members    : aantal ensemble members
+      model        : welk model gebruikt
     """
     meta = CITY_META.get(city)
     if not meta:
         return None
     _, lat, lon = meta
 
-    # icon_seamless: 40 members (globaal), gfs025: 31 members, gem_global: 21 members
-    models_to_try = ["icon_seamless", "gfs025", "gem_global"]
-    all_spreads = []
+    cache_key = f"{city}:{date}"
+    cache = _load_ensemble_cache()
+
+    # Cache hit: controleer of data nog vers is (< TTL uur oud)
+    if cache_key in cache:
+        entry = cache[cache_key]
+        cached_at = entry.get("cached_at", "")
+        try:
+            age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(cached_at)).total_seconds() / 3600
+            if age_h < _ENS_CACHE_TTL_HOURS:
+                return entry.get("data")
+        except Exception:
+            pass
+
+    # ECMWF ENS eerst (51 members, meest betrouwbaar), dan fallbacks
+    models_to_try = ["ecmwf_ifs025", "icon_seamless", "gfs025", "gem_global"]
+    result = None
 
     for model in models_to_try:
-        try:
-            r = requests.get(
-                "https://ensemble-api.open-meteo.com/v1/ensemble",
-                params={
-                    "latitude":      lat,
-                    "longitude":     lon,
-                    "daily":         "temperature_2m_max",
-                    "forecast_days": 16,
-                    "timezone":      "auto",
-                    "models":        model,
-                },
-                timeout=10,
-            )
-            if r.status_code != 200:
-                continue
+        members = _fetch_ensemble_members(lat, lon, date, model)
+        if members and len(members.get("max", [])) >= 10:
+            mx = members["max"]
+            mn = members["min"]
+            n  = len(mx)
+            p10 = mx[int(n * 0.10)]
+            p50 = mx[int(n * 0.50)]
+            p90 = mx[int(n * 0.90)]
+            result = {
+                "max_members": mx,
+                "min_members": mn,
+                "spread":      round(p90 - p10, 2),
+                "p10":         round(p10, 1),
+                "p50":         round(p50, 1),
+                "p90":         round(p90, 1),
+                "n_members":   n,
+                "model":       model,
+            }
+            break
 
-            data = r.json().get("daily", {})
-            times = data.get("time", [])
-            if date not in times:
-                continue
+    # Sla op in cache (ook bij None zodat we rate-limited requests niet herhalen)
+    cache[cache_key] = {
+        "data":      result,
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _save_ensemble_cache(cache)
+    return result
 
-            idx = times.index(date)
 
-            # Member kolommen: temperature_2m_max_member01, _member02, etc.
-            member_vals = []
-            for key, vals in data.items():
-                if "temperature_2m_max" in key and key != "temperature_2m_max":
-                    if isinstance(vals, list) and idx < len(vals) and vals[idx] is not None:
-                        member_vals.append(vals[idx])
+def ensemble_probability(
+    city: str,
+    date: str,
+    temp_low_c: float,
+    temp_high_c: float,
+    condition: str,
+    temp_type: str = "high",
+) -> Optional[float]:
+    """
+    Berekent P(YES) direct uit ensemble member verdeling.
 
-            if len(member_vals) < 10:
-                continue
+    In plaats van: consensus → normale verdeling → P(YES)
+    Doet dit:      tel members die de conditie voldoen / totaal members
 
-            member_vals.sort()
-            p10 = member_vals[int(len(member_vals) * 0.10)]
-            p90 = member_vals[int(len(member_vals) * 0.90)]
-            all_spreads.append(p90 - p10)
+    Dit is de meest directe en nauwkeurige methode — geen aanname van
+    normale verdeling, geen handmatige sigma-kalibratie.
 
-        except Exception:
-            continue
+    Args:
+        temp_low_c  : ondergrens in °C (gebruik -999 voor 'above' condities)
+        temp_high_c : bovengrens in °C (gebruik 999 voor 'below' condities)
+        condition   : "between", "above", "below"
+        temp_type   : "high" (dagmax) of "low" (dagmin)
 
-    if not all_spreads:
+    Returns: P(YES) als float 0.0–1.0, of None als geen ensemble data
+    """
+    ens = get_ensemble_data(city, date)
+    if ens is None:
         return None
 
-    # Gemiddelde spread over beschikbare ensembles
-    return round(sum(all_spreads) / len(all_spreads), 2)
+    members = ens["max_members"] if temp_type == "high" else ens.get("min_members", [])
+    if not members:
+        return None
+
+    n = len(members)
+    if condition == "above":
+        hits = sum(1 for m in members if m >= temp_low_c)
+    elif condition == "below":
+        hits = sum(1 for m in members if m <= temp_high_c)
+    else:  # between
+        hits = sum(1 for m in members if temp_low_c <= m <= temp_high_c)
+
+    return round(hits / n, 3)
+
+
+def get_ensemble_spread(city: str, date: str) -> Optional[float]:
+    """
+    Backwards-compatible wrapper: retourneert P10-P90 spread uit ensemble data.
+    Gebruikt get_ensemble_data() met caching intern.
+    """
+    ens = get_ensemble_data(city, date)
+    return ens["spread"] if ens else None
 
 
 def multi_source_forecast(city: str, date: str) -> dict:
@@ -748,7 +947,7 @@ def _save_forecast_cache(cache: dict):
         pass
 
 
-def detect_model_shift(city: str, date: str) -> dict | None:
+def detect_model_shift(city: str, date: str) -> Optional[dict]:
     """
     Detecteert significante verschuivingen in het weermodel t.o.v. 6+ uur geleden.
 

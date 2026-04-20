@@ -18,7 +18,9 @@ DATA_API = "https://data-api.polymarket.com"
 
 # Bekende winstgevende wallets (weather/temperature specialisten)
 KNOWN_WHALES = {
-    "ColdMath": "0x594edb9112f526fa6a80b8f858a6379c8a2c1c11",  # temperatuur specialist
+    "ColdMath":    "0x594edb9112f526fa6a80b8f858a6379c8a2c1c11",  # temperatuur specialist
+    "WeatherPro":  "0x8278252ebbf354eca8ce316e680a0eaf02859464",  # $25k winst, 1420 trades, 99% weather
+    "BeefSlayer":  "0x331bf91c132af9d921e1908ca0979363fc47193f",  # 100% weather, cheap YES strategie, since Mar 2026
 }
 
 

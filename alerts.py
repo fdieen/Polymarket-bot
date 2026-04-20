@@ -186,6 +186,27 @@ def notify_auto_trade(trade, dry_run: bool = False) -> bool:
     return send_telegram(msg)
 
 
+def notify_claimable(positions: list) -> bool:
+    """Stuurt een Telegram-notificatie voor gewonnen posities die geclaimed kunnen worden."""
+    if not telegram_configured() or not positions:
+        return False
+
+    total = sum(p.get("pnl", 0) for p in positions)
+    lines = []
+    for p in positions:
+        lines.append(f"• {p['question'][:55]} → +${p['pnl']:.2f}")
+
+    msg = (
+        f"💰 <b>Claimen op Polymarket!</b>\n"
+        f"\n"
+        f"{chr(10).join(lines)}\n"
+        f"\n"
+        f"Totaal claimbaar: <b>${total:.2f}</b>\n"
+        f"👉 <a href=\"https://polymarket.com/portfolio\">Ga naar portfolio</a>"
+    )
+    return send_telegram(msg)
+
+
 def notify_daily_summary(trades: list, spent: float) -> bool:
     """Dagelijkse samenvatting."""
     if not trades:

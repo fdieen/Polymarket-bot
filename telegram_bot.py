@@ -2,7 +2,7 @@
 Telegram Bot Command Handler — reageert op /commands.
 
 Beschikbare commands:
-  /portfolio  — P&L overzicht van het paper portfolio
+  /portfolio  — P&L overzicht van het live portfolio
   /trades     — Recente trades van vandaag
   /status     — Auto trader status
   /whales     — Whale posities
@@ -44,7 +44,7 @@ def send(chat_id: str, text: str):
 def handle_command(cmd: str, chat_id: str):
     cmd = cmd.lower().strip().split()[0]  # negeer argumenten
 
-    if cmd in ("/crypto", "/btc", "/c"):
+    if cmd in ("/whale", "/crypto", "/w2", "/c"):
         try:
             from portfolio import load_portfolio
             WHALE_PF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "whale_portfolio.json")
@@ -92,34 +92,68 @@ def handle_command(cmd: str, chat_id: str):
             whale_open = sum(1 for x in whale_pos if x["status"] == "open")
             model_open = sum(1 for x in model_pos if x["status"] == "open")
 
+            winrate_line = (
+                f"Win rate: {s['win_rate']}% ({s['wins']}W / {s['losses']}L)\n"
+                if s['closed_positions'] > 0 else "Win rate: — (nog geen gesloten trades)\n"
+            )
+            pnl_line = (
+                f"Totaal P&L: <b>{pnl_sign}${s['total_pnl']} ({pnl_sign}{s['total_pnl_pct']}%)</b>\n"
+                if s['total_pnl'] != 0 else ""
+            )
             msg = (
-                f"📊 <b>Paper Portfolio</b>\n\n"
-                f"💰 Equity:     <b>${s['total_equity']}</b>\n"
-                f"💵 Cash:       ${s['cash']}\n"
-                f"📈 Unrealized: {'+' if s['unrealized_pnl']>=0 else ''}${s['unrealized_pnl']}\n"
-                f"✅ Realized:   {'+' if s['realized_pnl']>=0 else ''}${s['realized_pnl']}\n"
-                f"📉 Totaal P&L: <b>{pnl_sign}${s['total_pnl']} ({pnl_sign}{s['total_pnl_pct']}%)</b>\n\n"
-                f"📋 Trades: {s['trade_count']} | Open: {s['open_positions']}\n"
-                f"🤖 Model: {model_open} open | 🐋 Whale: {whale_open} open\n"
-                f"🎯 Win rate: {s['win_rate']}% ({s['wins']}W / {s['losses']}L)\n"
-                f"🏦 Start: ${s['starting_balance']}"
+                f"📊 <b>Weather Portfolio</b>\n\n"
+                f"💰 Equity:  <b>${s['total_equity']}</b>\n"
+                f"💵 Cash:    ${s['cash']}\n"
+                f"📦 Open:    ${s['open_value']} ({s['open_positions']} positie{'s' if s['open_positions']!=1 else ''})\n"
+                + (f"📈 Unrealized: +${s['unrealized_pnl']}\n" if s['unrealized_pnl'] else "")
+                + (f"✅ Realized: +${s['realized_pnl']}\n" if s['realized_pnl'] else "")
+                + (pnl_line)
+                + f"\n🤖 Model: {model_open} | 🐋 Whale: {whale_open} open\n"
+                + winrate_line
+                + f"🏦 Start: ${s['starting_balance']}"
             )
         except Exception as e:
             msg = f"Fout: {e}"
 
     elif cmd in ("/trades", "/t"):
         try:
-            from auto_trader import state
-            trades = list(reversed(state.trades_today[-10:]))
-            if not trades:
-                msg = "Geen trades vandaag."
+            from portfolio import load_portfolio
+            from datetime import date
+            today = date.today().isoformat()
+            p = load_portfolio()
+
+            # Alle posities van vandaag (open + closed)
+            today_trades = [
+                pos for pos in p.positions
+                if pos.get("timestamp", "").startswith(today)
+            ]
+            # Sorteer nieuwste eerst
+            today_trades.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+
+            if not today_trades:
+                # Toon laatste 10 trades als er vandaag niets is
+                all_trades = sorted(p.positions, key=lambda x: x.get("timestamp", ""), reverse=True)[:10]
+                header = f"<b>Laatste trades</b> (geen trades vandaag)\n\n"
+            else:
+                all_trades = today_trades[:10]
+                header = f"<b>Trades vandaag ({len(today_trades)})</b>\n\n"
+
+            if not all_trades:
+                msg = "Nog geen trades."
             else:
                 lines = []
-                for t in trades:
-                    icon = "✓" if t.success else "✗"
-                    label = "[W]" if "WHALE" in t.note else "[M]"
-                    lines.append(f"{icon}{label} {t.direction} ${t.amount:.1f} | {t.question[:40]}")
-                msg = f"<b>Trades vandaag ({len(state.trades_today)})</b>\n\n" + "\n".join(lines)
+                for pos in all_trades:
+                    note  = pos.get("note", "")
+                    label = "[W]" if "WHALE" in note.upper() else "[M]"
+                    status = pos.get("status", "open")
+                    icon  = "✅" if status == "won" else "❌" if status == "lost" else "⏳"
+                    direction = pos.get("direction", "?")
+                    amount    = float(pos.get("amount") or 0)
+                    pnl       = float(pos.get("pnl") or 0)
+                    ts        = pos.get("timestamp", "")[:16].replace("T", " ")
+                    pnl_str   = f" | pnl={'+' if pnl>=0 else ''}${pnl:.2f}" if status in ("won","lost","sold") else ""
+                    lines.append(f"{icon}{label} {direction} ${amount:.0f}{pnl_str}\n    {pos.get('question','')[:50]}")
+                msg = header + "\n".join(lines)
         except Exception as e:
             msg = f"Fout: {e}"
 
@@ -145,7 +179,7 @@ def handle_command(cmd: str, chat_id: str):
         except Exception as e:
             msg = f"Fout: {e}"
 
-    elif cmd in ("/whales", "/w"):
+    elif cmd in ("/whales", "/wh"):
         try:
             from whale_tracker import KNOWN_WHALES, fetch_whale_activity
             lines = []
@@ -163,9 +197,9 @@ def handle_command(cmd: str, chat_id: str):
     elif cmd in ("/help", "/h", "/start"):
         msg = (
             "🤖 <b>Polymarket Bot Commands</b>\n\n"
-            "/portfolio — Weer portfolio P&L\n"
-            "/crypto    — Crypto portfolio (BTC)\n"
-            "/trades    — Trades van vandaag\n"
+            "/portfolio — Weather portfolio P&L\n"
+            "/whale     — Whale copy portfolio\n"
+            "/trades    — Recente trades\n"
             "/status    — Auto trader status\n"
             "/whales    — Whale activiteit\n"
             "/help      — Dit bericht"
@@ -203,6 +237,12 @@ def _poll():
                 text = msg.get("text", "")
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 if text.startswith("/") and chat_id:
+                    # Whitelist: alleen toegestane chat IDs
+                    allowed = [cid.strip() for cid in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if cid.strip()]
+                    if allowed and chat_id not in allowed:
+                        log.warning(f"Geblokkeerd: {chat_id} niet in whitelist")
+                        send(chat_id, "Je hebt geen toegang tot deze bot.")
+                        continue
                     log.info(f"Command: {text} van {chat_id}")
                     threading.Thread(
                         target=handle_command,

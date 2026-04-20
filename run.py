@@ -25,14 +25,58 @@ logging.basicConfig(
 log = logging.getLogger("run")
 
 
+def _fetch_wallet_balance() -> float | None:
+    """Haalt echte USDC balance op van Polymarket wallet."""
+    try:
+        from auto_trader import get_clob_client
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+        client = get_clob_client()
+        r = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        return int(r["balance"]) / 1_000_000
+    except Exception:
+        return None
+
+
 def _price_updater():
     """Updatet portfolioprijzen elke 5 minuten en resolved afgelopen markten."""
-    from portfolio import update_position_prices
+    from portfolio import update_position_prices, load_portfolio, save_portfolio
+    # Pre-seed met bestaande won-posities zodat herstart geen oude notificaties stuurt
+    try:
+        _notified = {p.get("id") for p in load_portfolio().positions if p.get("status") == "won"}
+        log.info(f"Claim-notificaties: {len(_notified)} bestaande won-posities overgeslagen")
+    except Exception:
+        _notified = set()
+
     while True:
         try:
             result = update_position_prices()
             if result["resolved"] > 0:
                 log.info(f"Auto-resolved: {result['resolved']} posities")
+
+            # Wallet balance syncen met portfolio.json
+            wallet_bal = _fetch_wallet_balance()
+            if wallet_bal is not None:
+                pf2 = load_portfolio()
+                if abs(pf2.cash - wallet_bal) > 0.10:  # alleen updaten bij verschil > 10 cent
+                    log.info(f"Wallet sync: ${pf2.cash:.2f} → ${wallet_bal:.2f}")
+                    pf2.cash = round(wallet_bal, 2)
+                    save_portfolio(pf2)
+
+            # Claimbare posities detecteren (won, nog niet gemeld)
+            pf = load_portfolio()
+            claimable = [
+                p for p in pf.positions
+                if p.get("status") == "won" and p.get("id") not in _notified
+            ]
+            if claimable:
+                try:
+                    from alerts import notify_claimable
+                    notify_claimable(claimable)
+                    for p in claimable:
+                        _notified.add(p.get("id"))
+                    log.info(f"Claim-notificatie gestuurd: {len(claimable)} posities (${sum(p.get('pnl',0) for p in claimable):.2f})")
+                except Exception as e:
+                    log.warning(f"Claim-notificatie fout: {e}")
         except Exception as e:
             log.warning(f"Price update fout: {e}")
         time.sleep(300)
