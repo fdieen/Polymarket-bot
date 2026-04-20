@@ -4472,7 +4472,7 @@ _WHALE_FOLLOW_STATE   = os.path.join(os.path.dirname(__file__), "data", "whale_f
 # Auto-follow config
 _WHALE_COPY_PCT      = 0.05   # 5% van resterende cash per trade
 _WHALE_MIN_COPY_SIZE = 100.0  # alleen kopiëren als whale >= $100 inzet
-_WHALE_CHECK_SECS    = 300    # check elke 5 minuten
+_WHALE_CHECK_SECS    = 90     # check elke 90 seconden
 
 # In-memory log van recente auto-copies
 _whale_copy_log: list = []

@@ -316,10 +316,18 @@ def check_price_stop(pos: dict) -> Optional[str]:
     if not entry or not current:
         return None
 
-    loss_pct = (entry - current) / entry
+    direction = pos.get("direction", "YES")
+
+    if direction == "NO":
+        # NO positie verliest als de YES-prijs stijgt boven onze entry
+        loss_pct = (current - entry) / entry
+    else:
+        # YES positie verliest als de prijs daalt onder onze entry
+        loss_pct = (entry - current) / entry
+
     if loss_pct >= PRICE_STOP_LOSS_PCT:
         return (
-            f"Prijs-stop: entry ${entry:.2f} → nu ${current:.2f} "
+            f"Prijs-stop ({direction}): entry ${entry:.2f} → nu ${current:.2f} "
             f"(verlies {loss_pct:.0%}, drempel {PRICE_STOP_LOSS_PCT:.0%})"
         )
     return None

@@ -39,6 +39,16 @@ TROPICAL_CITIES = {
 }
 TROPICAL_MIN_GAP = 0.55  # 55% gap vereist voor tropische steden (vs 35% normaal)
 
+# Mariene steden: zee/mist maakt temperatuurvariatie moeilijk voorspelbaar
+# SF: marine layer / advection fog; LA: zeebries + microklimaat per district
+# Historisch: T0083 (Miami via tropisch), T0096 (SF 62-63°F) → beide verlies op exacte banden
+MARINE_CITIES = {
+    "san francisco", "los angeles", "san diego",
+    "seattle",       "vancouver",   "portland",
+    "lisbon",        "dublin",      "bergen",
+}
+MARINE_MIN_GAP = 0.50   # 50% gap voor marine steden; exacte band krijgt extra penalty (zie verderop)
+
 # Steden → coördinaten
 CITIES = {
     "amsterdam":     (52.374,  4.890),
@@ -668,17 +678,25 @@ def scan() -> list[WeatherOpportunity]:
         # Gap drempel per markttype — gebaseerd op historische win rates
         # "or higher/lower": 2W/3L = 40% → drempel fors hoger
         # "between": 12W/1L = 92% → lage drempel volstaat
-        # Tropisch penalty wordt NA markttype toegepast (neem de hoogste)
+        # Stad-penalty wordt NA markttype toegepast (neem de hoogste)
         condition_type = parsed.get("condition", "")
+        city_lower = parsed["city"].lower()
         if condition_type in ("above", "below"):
             base_gap = 0.65        # or higher/below: 40% win rate → hoge drempel
         elif condition_type == "between":
             base_gap = 0.20        # between: 92% win rate → lagere drempel volstaat
         else:
             base_gap = MIN_GAP
-        # Tropische steden: drempel verhogen bovenop markttype (neem hoogste waarde)
-        if parsed["city"].lower() in TROPICAL_CITIES:
+        # Tropische steden: drempel verhogen bovenop markttype
+        if city_lower in TROPICAL_CITIES:
             base_gap = max(base_gap, TROPICAL_MIN_GAP)
+        # Marine steden: zee/mist maakt exacte banden onbetrouwbaar
+        # "between" krijgt extra penalty (1°F-band + marine onzekerheid = te risicovol)
+        if city_lower in MARINE_CITIES:
+            if condition_type == "between":
+                base_gap = max(base_gap, 0.50)   # exacte band marine stad: zelfde als tropical
+            else:
+                base_gap = max(base_gap, MARINE_MIN_GAP)
         effective_min_gap = base_gap * consensus_factor * boundary_factor
 
         # ── Model shift detectie ─────────────────────────────────────────────
