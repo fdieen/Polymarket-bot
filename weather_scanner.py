@@ -30,6 +30,10 @@ MIN_VOLUME = 50.0   # minimaal $50/dag volume — illiquide markten hebben slech
 # Daarom extra filter: alleen YES als poly_price >= 0.20
 MIN_YES_PRICE = 0.20
 
+# Exact band markten ("between X-Y°F") zijn historisch nauwelijks winstgevend (56% WR, -$1)
+# vs above/below markten die 100% WR hebben (+$304). Hogere gap drempel vereist.
+EXACT_BAND_MIN_GAP = 0.50  # 50% gap voor "between X-Y" markten (vs 35% normaal)
+
 # Tropische steden: stabiel warm weer maakt model minder betrouwbaar (6 van 14 verliesgevende trades)
 # Hogere drempel vereist om false positives te vermijden
 TROPICAL_CITIES = {
@@ -434,8 +438,8 @@ def scan() -> list[WeatherOpportunity]:
     from datetime import timedelta
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
-    # Minimaal 2 dagen vooruit — vandaag/morgen kan al bijna gesloten zijn door tijdzone
-    min_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    # Minimaal 1 dag vooruit — morgen-markten meenemen voor meer kansen
+    min_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Filter eerst: alleen parseerbare toekomstige markten met handelbare prijs
     candidates = []
@@ -675,16 +679,16 @@ def scan() -> list[WeatherOpportunity]:
         else:
             boundary_factor = 1.0
 
-        # Gap drempel per markttype — gebaseerd op historische win rates
-        # "or higher/lower": 2W/3L = 40% → drempel fors hoger
-        # "between": 12W/1L = 92% → lage drempel volstaat
+        # Gap drempel per markttype — bijgewerkt op basis van 31 gesloten trades
+        # "between" exact band: 56% WR, -$1 PnL → hoge drempel (was 0.20 / "92% WR" — verouderd)
+        # "or higher/lower": 100% WR, +$304 PnL → lage drempel volstaat
         # Stad-penalty wordt NA markttype toegepast (neem de hoogste)
         condition_type = parsed.get("condition", "")
         city_lower = parsed["city"].lower()
         if condition_type in ("above", "below"):
-            base_gap = 0.65        # or higher/below: 40% win rate → hoge drempel
+            base_gap = MIN_GAP     # 35% — above/below heeft 100% WR historisch
         elif condition_type == "between":
-            base_gap = 0.20        # between: 92% win rate → lagere drempel volstaat
+            base_gap = EXACT_BAND_MIN_GAP  # 50% — exact band is moeilijk, 56% WR historisch
         else:
             base_gap = MIN_GAP
         # Tropische steden: drempel verhogen bovenop markttype

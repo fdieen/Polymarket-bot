@@ -520,6 +520,7 @@ def run_whale_copy():
     # Laad whales uit whales.json (weather specialists), filter op crypto whales
     _WHALES_FILE = _os.path.join(_os.path.dirname(__file__), "data", "whales.json")
     _CRYPTO_KEYWORDS = {"btc", "bitcoin", "crypto", "eth", "floor"}
+    _WHALE_MIN_SIZES = {}  # per-whale min_copy_size overrides
     try:
         with open(_WHALES_FILE) as _f:
             _whale_list = _json.load(_f)
@@ -528,6 +529,10 @@ def run_whale_copy():
             w["name"]: w["address"] for w in _whale_list
             if not any(kw in w.get("note", "").lower() for kw in _CRYPTO_KEYWORDS)
         }
+        # Sla per-whale min_copy_size op (overschrijft globale whale_min_size)
+        for w in _whale_list:
+            if "min_copy_size" in w:
+                _WHALE_MIN_SIZES[w["name"]] = w["min_copy_size"]
     except Exception:
         from whale_tracker import KNOWN_WHALES as WEATHER_WHALES
 
@@ -553,8 +558,9 @@ def run_whale_copy():
             except Exception:
                 continue
 
-            # Minimale grootte
-            if t.usdc_size < cfg.whale_min_size:
+            # Minimale grootte (per-whale override mogelijk via min_copy_size in whales.json)
+            _min_size = _WHALE_MIN_SIZES.get(whale_name, cfg.whale_min_size)
+            if t.usdc_size < _min_size:
                 continue
 
             # Alleen BUY orders kopiëren (geen sells)
@@ -569,6 +575,9 @@ def run_whale_copy():
             market_key = f"whale:{t.condition_id}"
             if market_key in state.traded_markets:
                 continue
+            # Meteen markeren zodat andere trades in dezelfde scan-cyclus ook worden geblokkeerd
+            # (voorkomt dat whale DCA-trades allemaal worden gekopieerd binnen één scan)
+            state.traded_markets.add(market_key)
             try:
                 from portfolio import load_portfolio as _lp_dedup
                 _pf_dedup = _lp_dedup()
@@ -576,7 +585,6 @@ def run_whale_copy():
                     p.get("condition_id") == t.condition_id and p.get("status") == "open"
                     for p in _pf_dedup.positions
                 ):
-                    state.traded_markets.add(market_key)  # ook in set zodat volgende scan snel is
                     continue
             except Exception:
                 pass
@@ -613,14 +621,19 @@ def run_whale_copy():
             direction = "YES" if t.outcome == "Yes" else "NO"
             entry_price = t.price if direction == "YES" else (1 - t.price)
 
-            # Tail bets overslaan — entry <10¢ geeft onrealistisch hoge multipliers
-            if entry_price < 0.10:
-                state.add_log(f"SKIP tail bet {whale_name}: entry {entry_price*100:.1f}¢ < 10¢")
+            # Tail bets overslaan — historisch 0% WR onder 15¢ (was 10¢, -$96 verlies)
+            if entry_price < 0.15:
+                state.add_log(f"SKIP tail bet {whale_name}: entry {entry_price*100:.1f}¢ < 15¢")
                 continue
 
             # Near-certain bets overslaan — boven 90¢ is er nauwelijks winst mogelijk
-            if entry_price > 0.90:
-                state.add_log(f"SKIP whale {whale_name}: near-certain entry {entry_price*100:.1f}¢ > 90¢ (nauwelijks winst)")
+            # ColdMath-specifiek: al boven 70¢ skippen — hij wint vaak maar maakt <$1/trade,
+            # verliest $25+ als hij mis zit (83% WR maar -$44 PnL door asymmetrie)
+            # Let op: check de werkelijke prijs van de gekochte kant (YES-prijs voor YES, NO-prijs voor NO)
+            near_certain_threshold = 0.70 if whale_name == "ColdMath" else 0.90
+            actual_bet_price = t.price  # prijs van het token dat de whale kocht (YES of NO)
+            if actual_bet_price > near_certain_threshold:
+                state.add_log(f"SKIP whale {whale_name}: near-certain entry {actual_bet_price*100:.1f}¢ > {near_certain_threshold*100:.0f}¢")
                 continue
 
             # Edge-check: haal huidige marktprijs op en kijk hoeveel edge nog over is
@@ -706,8 +719,8 @@ def run_whale_copy():
             )
             with state._lock:
                 state.trades_today.append(trade_rec)
-                if success:
-                    state.traded_markets.add(market_key)
+                # Altijd markeren — ook bij falen (403/rejected) zodat bot niet blijft herproberen
+                state.traded_markets.add(market_key)
 
             state.add_log(
                 f"{'✓' if success else '✗'} [WHALE {whale_name}] [{conviction}] BUY {direction} "
